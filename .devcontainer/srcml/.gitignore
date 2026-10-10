@@ -1,0 +1,2 @@
+# Pre-downloaded srcML release tarballs live here; never commit them.
+*.tar.gz

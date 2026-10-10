@@ -51,6 +51,19 @@ cmake ../srcSlice
 make srcslice
 ```
 
+### Dev container:
+The repository ships a [dev container](.devcontainer/) based on Ubuntu 26.04 with the
+C++ toolchain, libxml2, nlohmann json, Boost headers and srcML 1.2.0 preinstalled
+(srcML comes from the release tarballs, for amd64 and arm64). Open the folder in
+VS Code and pick "Reopen in Container", or use the devcontainer CLI:
+```bash
+devcontainer up --workspace-folder .
+devcontainer exec --workspace-folder . cmake --build build --target srcslice
+```
+Submodules are initialized and CMake is configured into `build/` when the container
+is created. While the srcML release is still a GitHub draft, place the tarballs in
+`.devcontainer/srcml/` first (see the README in that folder).
+
 <br>
 
 ## Using srcSlice
