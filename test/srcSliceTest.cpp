@@ -31,9 +31,6 @@ std::string StringToSrcML(std::string str, const char* fileName){ // Function by
     srcml_archive_close(archive);
     srcml_archive_free(archive);
 
-    // ensure the final char is null-terminator
-    ch[size-1] = 0;
-
     // Copy the buffer content to a string so we
     // can deallocate the buffer created by:
     // `srcml_archive_write_open_memory`
@@ -75,7 +72,6 @@ std::string StringsToArchive(std::vector<std::string> contents, std::vector<std:
     srcml_archive_close(archive);
     srcml_archive_free(archive);
 
-    ch[size-1] = 0;
     archive_str.append(ch,size);
     srcml_memory_free(ch);
 
