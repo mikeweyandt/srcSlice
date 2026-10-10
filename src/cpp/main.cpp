@@ -25,6 +25,7 @@ int main(int argc, char **argv)
     // search for the output flag and set a marker
     std::string inputFile = "", outputFile = "";
     int threadCount = defaultThreads();
+    int backlogCap = 0, maxInFlight = 0;
     std::ofstream outFile;
     bool verboseMode = false, feedbackMode = false,
         showControlEdges = false, expandCalls = false,
@@ -47,6 +48,10 @@ int main(int argc, char **argv)
     app.add_flag    ("-a, --expand-aliases", expandAliases,         "Expand Alias list");
     app.add_flag    ("-v, --verbose", verboseMode,                  "Display Debug Info when Slicing");
     app.add_flag    ("-p, --progress", feedbackMode,                "Display Feedback Progress Bars");
+    app.add_option  ("--backlog", backlogCap,                       "Parsed units that may wait for a worker before the parser pauses [Default: threads]")
+        ->group("Tuning");
+    app.add_option  ("--in-flight", maxInFlight,                    "Started units that may wait to be merged in archive order [Default: 2 x threads]")
+        ->group("Tuning");
     
     CLI11_PARSE(app, argc, argv);
 
@@ -57,7 +62,9 @@ int main(int argc, char **argv)
         expandCalls,
         expandAliases,
         verboseMode,
-        feedbackMode
+        feedbackMode,
+        backlogCap,
+        maxInFlight
     };
 
     try {
@@ -78,7 +85,7 @@ int main(int argc, char **argv)
 
         SrcSliceHandler srcSliceHandler(info);
 
-        auto sliceProfileMap = srcSliceHandler.GetProfileMap();
+        auto& sliceProfileMap = srcSliceHandler.GetProfileMap();
 
         std::ostringstream sliceOutput;
 

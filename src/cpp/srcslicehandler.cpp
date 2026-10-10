@@ -32,33 +32,39 @@ int CPUCount() {
 #endif
 }
 
+void SrcSliceHandler::ApplyThreadSettings(int threads, int backlog, int inFlight) {
+    // if an invalid number is passed default to 1 thread
+    threadCount = (threads > 0) ? threads : 1;
+    const std::size_t workers = static_cast<std::size_t>(threadCount);
+
+    // parsed units waiting for a worker: one per worker by default, never fewer than one
+    backlogCap = (backlog > 0) ? static_cast<std::size_t>(backlog) : workers;
+    // started-but-unmerged units (the reorder buffer): room for every worker plus as many
+    // finished units waiting on an earlier one, never fewer than the workers
+    maxInFlight = (inFlight > 0) ? static_cast<std::size_t>(inFlight) : 2 * workers;
+    if (maxInFlight < workers) maxInFlight = workers;
+}
+
 SrcSliceHandler::SrcSliceHandler(const CliInfo& info) {
     verboseMode = info.verboseMode;
     progressMode = info.progressMode;
     calculateControlEdges = info.calculateControlEdges;
     expandCalls = info.expandCalls;
     expandAliases = info.expandAliases;
+    ApplyThreadSettings(info.threadCount, info.backlogCap, info.maxInFlight);
 
-    // if an invalid number is passed default to 1 thread
-    threadCount = (info.threadCount > 0) ? info.threadCount : 1;
+    auto parse = [this, &info]() {
+        // argument must be a c string (const char*) or else a saxError is thrown
+        srcSAXController control(info.inputFile.c_str());
+        Parse(control);
+    };
 
-    unitsScaned.store(false, std::memory_order_release);
-
-    std::thread t = std::thread(&SrcSliceHandler::ManageThreads, this);
-
-    // argument must be a c string (const char*) or else a saxError is thrown
-    srcSAXController control(info.inputFile.c_str());
-    srcDispatch::srcDispatcher<srcDispatch::UnitPolicy> handler(this);
-    
     if (progressMode) {
         // Save original buffers and Redirect cout and cerr
         IdleBar idlebar;
         std::cout << "[Slicing Started]" << "\n";
 
-        control.parse(&handler); // Start parsing
-        unitsScaned.store(true, std::memory_order_release);
-
-        if (t.joinable()) t.join();
+        RunPipeline(parse);
 
         // Restore original buffers
         idlebar.Finish("[srcSAXController Parse]");
@@ -70,11 +76,7 @@ SrcSliceHandler::SrcSliceHandler(const CliInfo& info) {
         idlebar.Finish("[Second-Pass]");
         std::cout << "[Slicing Finished]" << "\n";
     } else {
-        control.parse(&handler); // Start parsing
-
-        unitsScaned.store(true, std::memory_order_release);
-        if (t.joinable()) t.join();
-
+        RunPipeline(parse);
         Finalize();
     }
 }
@@ -85,190 +87,295 @@ SrcSliceHandler::SrcSliceHandler(std::string& sourceCodeStr, const TestArg& info
     expandAliases = info.expandAliases;
 
     // most test-suite inputs are single units; threading tests pass their own count
-    threadCount = (info.threadCount > 0) ? info.threadCount : 1;
+    ApplyThreadSettings(info.threadCount, info.backlogCap, info.maxInFlight);
 
-    srcSAXController control(sourceCodeStr);
-    srcDispatch::srcDispatcher<srcDispatch::UnitPolicy> handler(this);
-
-    unitsScaned.store(false, std::memory_order_release);
-
-    std::thread t = std::thread(&SrcSliceHandler::ManageThreads, this);
-
-    control.parse(&handler); // Start parsing
-
-    unitsScaned.store(true, std::memory_order_release);
-    if (t.joinable()) t.join();
+    RunPipeline([this, &sourceCodeStr]() {
+        srcSAXController control(sourceCodeStr);
+        Parse(control);
+    });
 
     Finalize();
 }
 
 SrcSliceHandler::~SrcSliceHandler() {
-    while (!backlog.empty()) {
-        if (backlog.front() != nullptr) {
-            delete backlog.front();
+    // backlog and inFlight own their workers; a worker's destructor joins its thread
+}
+
+void SrcSliceHandler::Parse(srcSAXController& control) {
+    srcDispatch::srcDispatcher<srcDispatch::UnitPolicy> handler(this);
+
+    // Notify stops this parser when the run is aborted; it is only valid during parse()
+    struct Active {
+        SrcSliceHandler* self;
+        ~Active() { self->activeParser = nullptr; }
+    } active{this};
+    activeParser = &handler;
+
+    control.parse(&handler); // Start parsing
+}
+
+void SrcSliceHandler::RunPipeline(const std::function<void()>& parse) {
+    std::thread manager(&SrcSliceHandler::ManageThreads, this);
+
+    // The manager must learn that the parse is over and be joined on every path, or its
+    // thread outlives this object. Run() is explicit so firstError can be read after the join.
+    struct FinishParse {
+        SrcSliceHandler* self;
+        std::thread& manager;
+        bool done = false;
+
+        void Run(bool parseFailed) {
+            if (done) return;
+            done = true;
+            {
+                std::lock_guard<std::mutex> lock(self->backlogMutex);
+                self->parseDone = true;
+                // a failed parse leaves nothing worth finalizing: drop the queued units
+                if (parseFailed) self->abortRun = true;
+            }
+            self->backlogCv.notify_all();
+            self->spaceCv.notify_all();
+            if (manager.joinable()) manager.join();
         }
-        backlog.pop();
+        ~FinishParse() { Run(true); }
+    } finish{this, manager};
+
+    std::exception_ptr parseError;
+    try {
+        parse();
+    } catch (const SAXError& e) {
+        // srcSAX's error type is not a std::exception; main() and the tests expect one
+        parseError = std::make_exception_ptr(std::runtime_error("srcSAX: " + e.message));
+    } catch (const std::exception&) {
+        parseError = std::current_exception();
+    } catch (const std::string& message) {
+        // srcSAXController's constructors throw a std::string when no context can be created
+        parseError = std::make_exception_ptr(std::runtime_error("srcSAX: " + message));
+    } catch (const char* message) {
+        parseError = std::make_exception_ptr(std::runtime_error(std::string("srcSAX: ") + message));
+    } catch (...) {
+        parseError = std::make_exception_ptr(std::runtime_error("parsing failed with an unknown exception"));
     }
+
+    finish.Run(parseError != nullptr);
+
+    // a worker failure stops the parser (XML_ERR_USER_STOP), so it is the cause when both are set
+    if (firstError) std::rethrow_exception(firstError);
+    if (parseError) std::rethrow_exception(parseError);
+}
+
+void SrcSliceHandler::FailRun(std::exception_ptr error, const std::string& where) {
+    std::string what = "unknown error";
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& e) {
+        what = e.what();
+    } catch (...) {}
+
+    auto wrapped = std::make_exception_ptr(std::runtime_error(where + " failed: " + what));
+    {
+        std::lock_guard<std::mutex> lock(backlogMutex);
+        if (!firstError) firstError = wrapped;
+        abortRun = true;
+    }
+    // wake the manager (if this is the parser thread) and the parser (if it waits for room)
+    backlogCv.notify_all();
+    spaceCv.notify_all();
 }
 
 void SrcSliceHandler::Notify(const srcDispatch::PolicyDispatcher *policy, const srcDispatch::srcSAXEventContext &ctx) {
     std::shared_ptr<srcDispatch::UnitData> unit = policy->Data<srcDispatch::UnitData>();
-    if (unit) {
-        // track what files are including to be used for fragment gluing
-        for (const auto& includeData : unit->includes) {
-            fileDependencyTable[ctx.currentFilePath].push_back(includeData->path.ToString());
-        }
+    if (!unit) return;
 
-        // lock the backlog because main and p_thread access this queue obj
-        std::lock_guard<std::mutex> lock(backlogMutex);
-
-        // push worker into queue
-        backlog.push(
-            new SrcSliceWorker(unit, ctx, verboseMode, calculateControlEdges)
-        );
+    // track what files are including to be used for fragment gluing
+    for (const auto& includeData : unit->includes) {
+        fileDependencyTable[ctx.currentFilePath].push_back(includeData->path.ToString());
     }
+
+    // build the worker outside the lock; the manager only needs the hand-over
+    auto worker = std::make_unique<SrcSliceWorker>(std::move(unit), ctx, verboseMode, calculateControlEdges);
+    worker->onDone = [this]() {
+        {
+            std::lock_guard<std::mutex> lock(backlogMutex);
+            --running;
+        }
+        backlogCv.notify_one();
+    };
+
+    std::unique_lock<std::mutex> lock(backlogMutex);
+
+    // bounded backlog (M5): block the parser until the manager has taken a unit
+    spaceCv.wait(lock, [this]() { return backlog.size() < backlogCap || abortRun; });
+
+    if (abortRun) {
+        // never throw through libxml2's C frames: stop the parser, RunPipeline reports firstError
+        lock.unlock();
+        if (activeParser) activeParser->stop_parser();
+        return;
+    }
+
+    worker->seq = nextSeq++;
+    ++stats.units;
+    backlog.push_back(std::move(worker));
+    stats.maxBacklog = std::max(stats.maxBacklog, backlog.size());
+
+    lock.unlock();
+    backlogCv.notify_one();
 }
 
+void SrcSliceHandler::MergeStructures(SrcSliceWorker& worker) {
+    Blob& data = worker.data;
+
+    // manually move map entry values, merge will not merge if the keys between both maps exist
+    for (auto& profileGroup : data.profileMap) {
+        auto& dest = profileMap[profileGroup.first];
+        dest.insert(
+            dest.end(),
+            std::make_move_iterator(profileGroup.second.begin()),
+            std::make_move_iterator(profileGroup.second.end())
+        );
+    }
+
+    // manually move map entry values, merge will not merge if the keys between both maps exist
+    for (auto& funcSig : data.functionSigMap) {
+        auto& dest = functionSigMap[funcSig.first];
+        dest.insert(
+            dest.end(),
+            std::make_move_iterator(funcSig.second.begin()),
+            std::make_move_iterator(funcSig.second.end())
+        );
+    }
+
+    // make_move_iterator prevents making copies
+    loopdata.insert(loopdata.end(),
+        std::make_move_iterator(data.loopdata.begin()),
+        std::make_move_iterator(data.loopdata.end())
+    );
+    forloopdata.insert(forloopdata.end(),
+        std::make_move_iterator(data.forloopdata.begin()),
+        std::make_move_iterator(data.forloopdata.end())
+    );
+    whileloopdata.insert(whileloopdata.end(),
+        std::make_move_iterator(data.whileloopdata.begin()),
+        std::make_move_iterator(data.whileloopdata.end())
+    );
+    dowhileloopdata.insert(dowhileloopdata.end(),
+        std::make_move_iterator(data.dowhileloopdata.begin()),
+        std::make_move_iterator(data.dowhileloopdata.end())
+    );
+
+    ifdata.insert(ifdata.end(),
+        std::make_move_iterator(data.ifdata.begin()),
+        std::make_move_iterator(data.ifdata.end())
+    );
+    ifStmts.insert(ifStmts.end(),
+        std::make_move_iterator(data.ifStmts.begin()),
+        std::make_move_iterator(data.ifStmts.end())
+    );
+    elsedata.insert(elsedata.end(),
+        std::make_move_iterator(data.elsedata.begin()),
+        std::make_move_iterator(data.elsedata.end())
+    );
+    elseifdata.insert(elseifdata.end(),
+        std::make_move_iterator(data.elseifdata.begin()),
+        std::make_move_iterator(data.elseifdata.end())
+    );
+
+    /*
+        after merging a sub-structure:
+            - perform interprocedural against the shared structure
+
+            - gather partial slices that later are dealt with via
+              the second pass (finalize)
+    */
+
+    // Handles Collecting Control-Edges
+    if (calculateControlEdges) ComputeControlPaths();
+
+    // populates Aliases attribute in slice profiles and
+    // performs crude interprocedural to connect use/def data
+    if (expandAliases) ComputeAliasInterprocedural();
+    ComputeInterprocedural();
+}
+
+/*
+    Manager thread. Units arrive from the parser in archive order (seq); up to threadCount of
+    them are sliced concurrently and the results are merged strictly in seq order, so the main
+    structure is built exactly as a single-threaded run builds it. Memory is bounded by
+    backlogCap unit models waiting, threadCount models being sliced and maxInFlight Blobs.
+    The thread sleeps on backlogCv between events instead of polling the queue.
+*/
 void SrcSliceHandler::ManageThreads() {
-    auto MergeStructures = [this](SrcSliceWorker* worker) {
-        if (worker == nullptr) return;
+    const std::size_t workers = static_cast<std::size_t>(threadCount);
+    std::unique_lock<std::mutex> lock(backlogMutex);
 
-        std::lock_guard<std::mutex> lock(dataMutex);
-        Blob& data = worker->data;
+    while (!abortRun) {
+        try {
+            // 1. start workers while there is a unit, a free thread and room in the window
+            while (!abortRun && !backlog.empty() && running < workers && inFlight.size() < maxInFlight) {
+                inFlight.push_back(std::move(backlog.front()));
+                backlog.pop_front();
+                SrcSliceWorker* worker = inFlight.back().get();
+                ++running;
+                stats.maxRunning = std::max(stats.maxRunning, running);
+                stats.maxInFlight = std::max(stats.maxInFlight, inFlight.size());
 
-        // manually move map entry values, merge will not merge if the keys between both maps exist
-        for (auto& profileGroup : data.profileMap) {
-            auto& dest = profileMap[profileGroup.first];
-            dest.insert(
-                dest.end(),
-                std::make_move_iterator(profileGroup.second.begin()),
-                std::make_move_iterator(profileGroup.second.end())
-            );
-        }
-
-        // manually move map entry values, merge will not merge if the keys between both maps exist
-        for (auto& funcSig : data.functionSigMap) {
-            auto& dest = functionSigMap[funcSig.first];
-            dest.insert(
-                dest.end(),
-                std::make_move_iterator(funcSig.second.begin()),
-                std::make_move_iterator(funcSig.second.end())
-            );
-        }
-        
-        // make_move_iterator prevents making copies
-        loopdata.insert(loopdata.end(),
-            std::make_move_iterator(data.loopdata.begin()),
-            std::make_move_iterator(data.loopdata.end())
-        );
-        forloopdata.insert(forloopdata.end(),
-            std::make_move_iterator(data.forloopdata.begin()),
-            std::make_move_iterator(data.forloopdata.end())
-        );
-        whileloopdata.insert(whileloopdata.end(),
-            std::make_move_iterator(data.whileloopdata.begin()),
-            std::make_move_iterator(data.whileloopdata.end())
-        );
-        dowhileloopdata.insert(dowhileloopdata.end(),
-            std::make_move_iterator(data.dowhileloopdata.begin()),
-            std::make_move_iterator(data.dowhileloopdata.end())
-        );
-        
-        ifdata.insert(ifdata.end(),
-            std::make_move_iterator(data.ifdata.begin()),
-            std::make_move_iterator(data.ifdata.end())
-        );
-        ifStmts.insert(ifStmts.end(),
-            std::make_move_iterator(data.ifStmts.begin()),
-            std::make_move_iterator(data.ifStmts.end())
-        );
-        elsedata.insert(elsedata.end(),
-            std::make_move_iterator(data.elsedata.begin()),
-            std::make_move_iterator(data.elsedata.end())
-        );
-        elseifdata.insert(elseifdata.end(),
-            std::make_move_iterator(data.elseifdata.begin()),
-            std::make_move_iterator(data.elseifdata.end())
-        );
-
-        /*
-            while under the mutex lock:
-                - perform interprocedural against the shared structure
-                  after merging it with a sub-structure
-
-                - gather partial slices that later are dealt with via
-                  the second pass (finalize)
-        */
-
-        // Handles Collecting Control-Edges
-        if (calculateControlEdges) ComputeControlPaths();
-        
-        // populates Aliases attribute in slice profiles and
-        // performs crude interprocedural to connect use/def data
-        if (expandAliases) ComputeAliasInterprocedural();
-        ComputeInterprocedural();
-    };
-
-    auto replaceWorker = [this](SrcSliceWorker** worker) {
-        if (!backlog.empty()) {
-            if (backlog.front() != nullptr) {
-                // start worker
-                *worker = backlog.front();
-                (*worker)->Start();
-            }
-
-            // remove from backlog
-            backlog.pop();
-        }
-    };
-    
-    std::vector<SrcSliceWorker*> workers(threadCount, nullptr);
-    bool runningJobs = true;
-
-    while (runningJobs) {
-        // lock the backlog because main and p_thread access this queue obj
-        std::lock_guard<std::mutex> lock(backlogMutex);
-        
-        int activeJobs = 0;
-
-        for (int i = 0; i < threadCount; ++i) {
-            if (workers[i] != nullptr) {
-                if (workers[i]->Finished()) {
-                    workers[i]->WaitForJob();
-                    
-                    // merge worker blob into main structure
-                    MergeStructures(workers[i]);
-                    
-                    // replace worker with front of queue
-                    delete workers[i]; // deallocate SrcSliceWorker object
-                    workers[i] = nullptr;
-                } else {
-                    // job is active do not continue
-                    // the iteration and potentially replace this active worker
-                    ++activeJobs;
+                // only this thread removes from inFlight, so the pointer stays valid unlocked
+                lock.unlock();
+                spaceCv.notify_one(); // the parser may be waiting for backlog room
+                try {
+                    worker->Start();
+                } catch (...) {
+                    // thread creation failed: account for it like a finished worker
+                    worker->error = std::current_exception();
+                    worker->jobFinished.store(true, std::memory_order_release);
+                    lock.lock();
+                    --running;
                     continue;
                 }
+                lock.lock();
             }
 
-            // pass pointer by reference so we can reassign its reference
-            replaceWorker(&workers[i]);
+            // 2. merge the oldest started unit once it is done (seq order == parse order)
+            if (!abortRun && !inFlight.empty() && inFlight.front()->Finished()) {
+                std::unique_ptr<SrcSliceWorker> worker = std::move(inFlight.front());
+                inFlight.pop_front();
 
-            // replaced workers should be marked as an active job
-            if (workers[i] != nullptr) {
-                ++activeJobs;
+                lock.unlock();
+                worker->WaitForJob(); // completion is already published; this reaps the thread
+                if (worker->error) {
+                    FailRun(worker->error, "slicing unit #" + std::to_string(worker->seq + 1)
+                                           + " (" + worker->sctx.currentFilePath + ")");
+                } else {
+                    MergeStructures(*worker);
+                }
+                lock.lock();
+                ++stats.merged;
+                continue;
             }
-        }
 
-        // all jobs have been dispatched and completed
-        // and no jobs are active
-        bool allDone = unitsScaned.load(std::memory_order_acquire)
-                   && backlog.empty()
-                   && activeJobs == 0;
+            // 3. nothing left and nothing more to come
+            if (parseDone && backlog.empty() && inFlight.empty()) return;
 
-        if (allDone) {
-            runningJobs = false;
+            // 4. sleep until one of the three conditions above changes
+            backlogCv.wait(lock, [&]() {
+                return abortRun
+                    || (!backlog.empty() && running < workers && inFlight.size() < maxInFlight)
+                    || (!inFlight.empty() && inFlight.front()->Finished())
+                    || (parseDone && backlog.empty() && inFlight.empty());
+            });
+        } catch (...) {
+            // merging failed (e.g. std::bad_alloc): fail the run like a worker exception
+            if (lock.owns_lock()) lock.unlock();
+            FailRun(std::current_exception(), "merging unit results");
+            lock.lock();
         }
     }
+
+    // aborted: let the running workers publish, then drop every queued and unmerged unit
+    backlogCv.wait(lock, [this]() { return running == 0; });
+    inFlight.clear(); // joins the (already finished) threads
+    backlog.clear();
 }
 
 std::unordered_map<std::string, std::vector<SliceProfile>>& SrcSliceHandler::GetProfileMap() {

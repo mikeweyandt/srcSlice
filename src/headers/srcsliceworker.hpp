@@ -16,6 +16,7 @@
 
 #include <chrono>
 #include <atomic>
+#include <functional>
 #include <thread>
 
 #include <exception>
@@ -166,6 +167,8 @@ namespace SrcSliceOperations {
     bool isWhiteSpace(const std::string& str);
 };
 
+// One parsed unit on its way into the main structure. The manager (SrcSliceHandler) starts it,
+// waits for it and merges `data`; the unit model is released as soon as the Blob exists.
 class SrcSliceWorker {
 public:
     SrcSliceWorker(std::shared_ptr<srcDispatch::UnitData> unitData, const srcDispatch::srcSAXEventContext &ctx,
@@ -184,6 +187,16 @@ public:
     Blob data;
     SliceCtx sctx;
     bool dispatched;
+
+    // position of the unit in the archive; the manager merges in this order
+    std::size_t seq = 0;
+    // set when Perform failed; the manager turns it into a run failure naming the unit
+    std::exception_ptr error;
+    // invoked exactly once by the work thread after jobFinished is set, on every exit path
+    std::function<void()> onDone;
+
+    // test-only: called at the top of Perform with the unit's context (throw to simulate a failure)
+    inline static std::function<void(const SliceCtx&)> testHook;
 };
 
 #endif

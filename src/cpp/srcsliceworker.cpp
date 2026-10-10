@@ -24,22 +24,34 @@ SrcSliceWorker::~SrcSliceWorker() {
 }
 
 void SrcSliceWorker::Perform() {
-    if (!unit) {
-        std::cerr << "[-] Unit Information Invalid\n";
-        jobFinished.store(true, std::memory_order_release);
-        return;
+    // publish completion last, whatever happened above: the manager waits on it
+    struct Publish {
+        SrcSliceWorker* self;
+        ~Publish() {
+            self->jobFinished.store(true, std::memory_order_release);
+            if (self->onDone) self->onDone();
+        }
+    } publish{this};
+
+    try {
+        if (testHook) testHook(sctx);
+        if (!unit) throw std::runtime_error("unit information invalid");
+
+        // Process Global Decls
+        SrcSliceOperations::ProcessDecls(data, sctx, unit->declStmts, "", true);
+        // Capture Function Signatures
+        SrcSliceOperations::ProcessSignatures(data, sctx, unit->functions, unit->classes);
+        // Process Free Functions
+        SrcSliceOperations::ProcessFunctions(data, sctx, unit->functions);
+        // Process Classes
+        SrcSliceOperations::ProcessClasses(data, sctx, unit->classes);
+    } catch (...) {
+        error = std::current_exception();
     }
 
-    // Process Global Decls
-    SrcSliceOperations::ProcessDecls(data, sctx, unit->declStmts, "", true);
-    // Capture Function Signatures
-    SrcSliceOperations::ProcessSignatures(data, sctx, unit->functions, unit->classes);
-    // Process Free Functions
-    SrcSliceOperations::ProcessFunctions(data, sctx, unit->functions);
-    // Process Classes
-    SrcSliceOperations::ProcessClasses(data, sctx, unit->classes);
-
-    jobFinished.store(true, std::memory_order_release);
+    // the unit model is dead once the Blob exists; drop it here so a unit waiting to be
+    // merged costs only its Blob
+    unit.reset();
 }
 
 void SrcSliceWorker::Start() {

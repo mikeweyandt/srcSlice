@@ -350,7 +350,8 @@ def run_srcslice(srcslice: Path, archive: Path, out: Path, extra_args: list[str]
 
 
 def bench_input(name: str, spec: dict, srcslice: Path, extra_args: list[str],
-                repeat: int, verify: bool, diff_limit: int) -> tuple[dict, dict]:
+                repeat: int, verify: bool, diff_limit: int,
+                allow_thread_divergence: bool = False) -> tuple[dict, dict]:
     archive, info = prepare_input(name, spec)
     out_dir = CACHE_DIR / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -379,17 +380,21 @@ def bench_input(name: str, spec: dict, srcslice: Path, extra_args: list[str],
         "runs": runs,
     }
     if verify:
-        result["output_check"] = check_timed_output(name, spec, srcslice, archive, out, extra_args, diff_limit)
+        result["output_check"] = check_timed_output(name, spec, srcslice, archive, out, extra_args, diff_limit,
+                                                    allow_thread_divergence)
     return info, result
 
 
 def check_timed_output(name: str, spec: dict, srcslice: Path, archive: Path, out: Path,
-                       extra_args: list[str], diff_limit: int) -> dict | None:
+                       extra_args: list[str], diff_limit: int,
+                       allow_thread_divergence: bool = False) -> dict | None:
     """Verify the last timed output against the golden.
 
-    A multithreaded output that differs is re-checked with a single-threaded run, since
-    only that one is reproducible; the number of files the threaded run got differently
-    is reported alongside.
+    srcslice merges units in archive order whatever the thread count, so a threaded run
+    must match the (single-threaded) golden. One that differs is re-checked with `-t 1` to
+    tell a threading defect ("thread-divergence": -t 1 matches) from a plain output change
+    ("mismatch"). Both fail the run; --allow-thread-divergence downgrades the former to
+    "ok-single-thread" for bisecting.
     """
     golden = load_golden(name)
     if golden is None:
@@ -410,8 +415,10 @@ def check_timed_output(name: str, spec: dict, srcslice: Path, archive: Path, out
         return v
     v1 = verify_output(name, out1, golden, diff_limit)
     v1["threaded_changed_files"] = v["changed_files"]
+    if "report" in v:
+        v1["threaded_report"] = v["report"]
     if v1["status"] == "ok":
-        v1["status"] = "ok-single-thread"
+        v1["status"] = "ok-single-thread" if allow_thread_divergence else "thread-divergence"
     log(f"{name}: output {check_label(v1)}")
     return v1
 
@@ -990,7 +997,9 @@ def check_label(c: dict | None) -> str:
     if s == "ok":
         return "ok"
     if s == "ok-single-thread":
-        return f"ok (-t 1); threaded run differs in {c['threaded_changed_files']} file(s)"
+        return f"ok (-t 1); threaded run differs in {c['threaded_changed_files']} file(s) (allowed)"
+    if s == "thread-divergence":
+        return f"THREADED OUTPUT DIFFERS in {c['threaded_changed_files']} file(s); -t 1 matches"
     if s == "mismatch":
         return f"MISMATCH ({c['changed_files']} changed, {c['added_files']} added, {c['removed_files']} removed)"
     if s == "unreadable":
@@ -1119,6 +1128,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--verify", action="store_true", help="run each input once (single-threaded), check its output and exit")
     g.add_argument("--save-golden", action="store_true", help="record the current output as the golden for the selected inputs (--force to replace)")
     g.add_argument("--no-verify", action="store_true", help="skip the output check after the timing runs")
+    g.add_argument("--allow-thread-divergence", action="store_true",
+                   help="do not fail when only the threaded output differs from the golden (the -t 1 recheck matches)")
     g.add_argument("--diff-limit", type=int, default=10, help="files detailed in a mismatch report (default 10)")
     g.add_argument("--diff-lines", type=int, default=40, help="report lines echoed to the console (default 40)")
     g.add_argument("--diff-summary", action="store_true",
@@ -1180,7 +1191,8 @@ def main(argv: list[str] | None = None) -> int:
     for name in sizes:
         repeat = args.repeat or DEFAULT_REPEAT.get(name, 3)
         result["inputs"][name], result["results"][name] = bench_input(
-            name, inputs[name], srcslice, extra_args, repeat, not args.no_verify, args.diff_limit)
+            name, inputs[name], srcslice, extra_args, repeat, not args.no_verify, args.diff_limit,
+            args.allow_thread_divergence)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_file = RESULTS_DIR / (meta["timestamp"].replace("-", "").replace(":", "") + ".json")
@@ -1218,9 +1230,10 @@ def main(argv: list[str] | None = None) -> int:
                   if r.get("output_check") and r["output_check"]["status"] not in ("ok", "ok-single-thread")]
     for n in mismatched:
         c = result["results"][n]["output_check"]
-        if "report" in c:
-            lines = Path(c["report"]).read_text().splitlines()
-            print(f"\n{rel(Path(c['report']))}:\n  " + "\n  ".join(lines[:args.diff_lines]))
+        report = c.get("report") or c.get("threaded_report")
+        if report:
+            lines = Path(report).read_text().splitlines()
+            print(f"\n{rel(Path(report))}:\n  " + "\n  ".join(lines[:args.diff_lines]))
             if len(lines) > args.diff_lines:
                 print(f"  ... {len(lines) - args.diff_lines} more line(s) in the report")
     if mismatched:

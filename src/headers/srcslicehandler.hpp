@@ -15,8 +15,13 @@
 #include <srcsliceparse.hpp>
 #include <srcsliceworker.hpp>
 
+#include <algorithm>
+#include <condition_variable>
+#include <functional>
+#include <deque>
+#include <memory>
 #include <mutex>
-#include <queue>
+#include <thread>
 
 #include <exception>
 #include <unordered_map>
@@ -58,9 +63,6 @@ typedef srcDispatch::DeltaElement<std::shared_ptr<srcDispatch::BlockData>> Block
 typedef std::vector<srcDispatch::DeltaElement<std::shared_ptr<srcDispatch::FunctionData>>> Functions;
 typedef std::vector<srcDispatch::DeltaElement<std::shared_ptr<srcDispatch::ClassData>>> Classes;
 
-inline std::atomic_bool unitsScaned{false};
-inline std::mutex dataMutex;
-
 struct CliInfo {
     std::string inputFile;
     std::string outputFile;
@@ -70,6 +72,9 @@ struct CliInfo {
     bool expandAliases;
     bool verboseMode;
     bool progressMode;
+    // pipeline tuning (0 = default: backlogCap = threadCount, maxInFlight = 2 * threadCount)
+    int backlogCap = 0;
+    int maxInFlight = 0;
 };
 struct TestArg {
     bool calculateControlEdges;
@@ -79,6 +84,15 @@ struct TestArg {
     int threadCount = 1;
     int backlogCap = 0;
     int maxInFlight = 0;
+};
+
+// Counters the manager keeps while a run is in progress (read after the constructor returns).
+struct PipelineStats {
+    std::size_t units = 0;          // units handed to the manager by the parser
+    std::size_t merged = 0;         // units merged into the main structure
+    std::size_t maxBacklog = 0;     // most parsed-but-not-started units at any time (<= backlogCap)
+    std::size_t maxInFlight = 0;    // most started-but-not-merged units at any time (<= maxInFlight)
+    std::size_t maxRunning = 0;     // most worker threads alive at any time (<= threadCount)
 };
 
 class SrcSliceHandler : public srcDispatch::PolicyListener {
@@ -96,6 +110,7 @@ public:
     void NotifyWrite(const srcDispatch::PolicyDispatcher *policy [[maybe_unused]], srcDispatch::srcSAXEventContext &ctx [[maybe_unused]]) {};
 
     std::unordered_map<std::string, std::vector<SliceProfile>>& GetProfileMap();
+    const PipelineStats& GetStats() const { return stats; }
 
     /*
         srcSlice focuses on Forward-Slicing, therefor our Control-Flows are going to be forward-flowing
@@ -125,6 +140,14 @@ public:
     void ManageThreads();
 
 private:
+    // Runs the parse callable with the manager thread alive, waits for every unit to be merged
+    // and rethrows the first failure (a worker exception or a parse error) as std::runtime_error.
+    void RunPipeline(const std::function<void()>& parse);
+    void Parse(srcSAXController& control);
+    void FailRun(std::exception_ptr error, const std::string& where);
+    void MergeStructures(SrcSliceWorker& worker);
+    void ApplyThreadSettings(int threads, int backlog, int inFlight);
+
     std::unordered_map<std::string, std::vector<SliceProfile>> profileMap;
     std::unordered_set <std::string> visited_func;
 
@@ -146,9 +169,24 @@ private:
     bool expandCalls = false;
     bool expandAliases = false;
 
+    // ---- unit pipeline: parser thread (Notify) -> workers -> manager thread (merge in parse order)
+    // Every field below is guarded by backlogMutex unless stated otherwise.
     std::mutex backlogMutex;
-    int threadCount;
-    std::queue<SrcSliceWorker*> backlog;
+    std::condition_variable backlogCv;   // wakes the manager: unit queued, worker finished, parse done, abort
+    std::condition_variable spaceCv;     // wakes the parser: backlog has room, or abort
+    std::deque<std::unique_ptr<SrcSliceWorker>> backlog;    // parsed, not started (FIFO)
+    std::deque<std::unique_ptr<SrcSliceWorker>> inFlight;   // started, not merged, in start (= parse) order
+    std::size_t nextSeq = 0;             // sequence number of the next unit the parser hands over
+    std::size_t running = 0;             // worker threads that have not published completion yet
+    bool parseDone = false;              // the parser has returned; no more units will arrive
+    bool abortRun = false;               // a worker or the parser failed: drop everything, stop the parser
+    std::exception_ptr firstError;       // the failure that set abortRun
+    PipelineStats stats;
+    srcSAXHandler* activeParser = nullptr;   // set by the parser thread for the duration of the parse
+
+    int threadCount = 1;
+    std::size_t backlogCap = 1;          // >= 1
+    std::size_t maxInFlight = 2;         // >= threadCount
 
     std::unordered_map<std::string, std::vector<std::string>> fileDependencyTable;
 
