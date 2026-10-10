@@ -25,8 +25,9 @@ srcslice it runs for about an hour and needs well over 20 GB of RAM, so skip it 
 ## Quick start (inside the dev container)
 
 ```bash
-./benchmark/run.sh                                   # run all three, compare with the latest baseline
-./benchmark/run.sh --sizes small,medium              # fast loop while iterating (also medium-cpp)
+./benchmark/run.sh                                   # quick set (small, medium, medium-cpp) vs the latest baseline
+./benchmark/run.sh --sizes small                     # fastest loop while iterating
+./benchmark/run.sh --sizes all                       # adds the kernel inputs: large ~30 min per run, x-large OOMs
 ./benchmark/run.sh --history                         # every baseline version, Δ vs previous and vs first
 ```
 
@@ -60,6 +61,61 @@ hour-long `x-large` can be added or refreshed on its own:
 The latest baseline is the highest version number present, so the files can be
 committed in any order.
 
+## Output regression tests
+
+Every input also has a recorded *golden* slice in `golden/<input>.json`, so a performance
+change can be checked for changed results, not just changed timing:
+
+```bash
+./benchmark/run.sh --verify                          # quick set: slice once each, compare with the goldens (~1 min)
+./benchmark/run.sh --verify --sizes small            # just srcSlice itself (a second)
+ctest --test-dir build -R regression                 # same check for `small`, wired into ctest
+```
+
+A timing run checks its last output as well (`output check` column; `--no-verify` skips
+it), and the exit code is 1 whenever an output differs. On a mismatch the console shows
+the first lines of `cache/out/<input>.verify.txt`, which lists the changed files and, per
+changed entry, the fields that differ and the positions added or removed:
+
+```
+~ file src/backend/parser/parse_expr.c
+  ~ node-1234-17-9f2b...
+      use: -1 +0
+        - "src/backend/parser/parse_expr.c:1250:9"
+```
+
+What is compared is a canonical form of the output, not the bytes: entries are matched
+by key, object keys are sorted and the set-valued arrays (`use`, `definition`, `calls`,
+`dependence`, `aliases`, `controlEdges`) are compared as sets. Reordering output or
+changing its whitespace is therefore not a regression; dropping or adding a position is.
+The committed manifest holds one hash per source file (so a diff in git shows which files
+moved) and `cache/golden/<input>.canon.gz` keeps the full canonical output that the
+entry-level diff needs. Entries srcslice writes as invalid JSON (it does not escape quotes
+in names such as `operator "" _a`) are compared as text.
+
+**Goldens are recorded and checked single-threaded (`-t 1`).** With several threads
+srcslice's interprocedural pass sees units in a timing-dependent order and the `use` and
+`calls` sets change from run to run (8 of 22 files differ between two 32-thread runs of
+`small`), so only the single-threaded output is reproducible. When a threaded timing run
+differs from the golden, the check reruns that input with `-t 1` and reports
+`ok (-t 1); threaded run differs in N file(s)`; that N should drop to zero once the
+ordering dependence is fixed. Pass `-t` yourself in `--srcslice-args` to override.
+
+When a change is *meant* to alter the output (a fixed slice), re-record and commit the
+goldens with the change:
+
+```bash
+./benchmark/run.sh --save-golden --force --note "fix cross-file position collisions"
+```
+
+Goldens exist for the quick set. The kernel input `large` has none yet: it takes about 30
+minutes and 24 GB per run, so record it deliberately when a large check is wanted
+(`./benchmark/run.sh --save-golden --sizes large`, then `--verify --sizes large`).
+`--save-golden --sizes all` skips inputs whose latest baseline recorded a failure (`x-large`
+cannot finish on 60 GB). A golden records the input commit, the srcslice commit
+and the arguments it was produced with; verifying against a golden recorded for a different
+input commit or with different arguments prints a warning first.
+
 ## Reading the tables
 
 The run summary lists, per input: file count, source and archive size, one-off srcml
@@ -78,7 +134,7 @@ Add `--format markdown` to paste either table into a PR.
 ## All options
 
 ```
---sizes small,medium,...      which inputs to run (default: all; see inputs.json)
+--sizes quick|all|small,...  which inputs to run (default quick = small,medium,medium-cpp; all adds large,x-large)
 --repeat N                   override the per-size repeat count
 --srcslice PATH              time this binary instead of building build-release/
 --srcslice-args="-t 8"       extra arguments passed to srcslice (use the = form)
@@ -90,13 +146,19 @@ Add `--format markdown` to paste either table into a PR.
 --note TEXT                  free text stored with the result/baseline
 --history [--format markdown]
 --update-inputs              move inputs.json pins to the current default-branch heads
+
+--verify                     slice each input once (-t 1), compare with golden/, exit 1 on a difference
+--save-golden [--force]      record the current output as the golden for the selected inputs
+--no-verify                  skip the output check after the timing runs
+--diff-limit N               files detailed in a mismatch report (default 10)
+--diff-lines N               report lines echoed to the console (default 40)
 ```
 
 ## Notes
 
 - Baselines are machine specific. Record them on the same machine, ideally in the
   dev container, and read deltas rather than absolute numbers across machines.
-- `cache/` and `results/` are gitignored. The kernel inputs need about 19 GB of disk
+- `cache/` (including the full golden outputs) and `results/` are gitignored. The kernel inputs need about 19 GB of disk
   (one 2 GB checkout shared by large and x-large, a 3 GB and a 13 GB srcML archive; srcml
   writes the big one in under a minute on a 32-core machine). Delete `cache/` to start over.
 - Each run is also written to `results/<timestamp>.json`, whether or not it becomes a

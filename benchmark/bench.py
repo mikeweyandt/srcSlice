@@ -4,11 +4,15 @@ srcslice benchmark runner.
 
 Times `srcslice` on cached srcML archives of pinned codebases (inputs.json), writes every
 run to results/, keeps versioned baselines in baselines/ and compares runs against them.
+Also checks that the slice output still matches the recorded golden outputs (golden/).
 Run ./benchmark/run.sh --help, or read benchmark/README.md.
 """
 from __future__ import annotations
 
 import argparse
+import collections
+import gzip
+import hashlib
 import json
 import os
 import platform
@@ -35,6 +39,8 @@ RELEASE_BUILD_DIR = ROOT / "build-release"
 
 DEFAULT_REPEAT = {"small": 5, "medium": 3, "medium-cpp": 3, "large": 3, "x-large": 1}
 SIZE_ORDER = ["small", "medium", "medium-cpp", "large", "x-large"]
+# the default set: the kernel inputs (large, x-large) take 30+ minutes and are run only when named
+QUICK_SIZES = ["small", "medium", "medium-cpp"]
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -320,27 +326,38 @@ def time_once(cmd: list[str]) -> dict:
     }
 
 
-def bench_input(name: str, spec: dict, srcslice: Path, extra_args: list[str],
-                repeat: int) -> tuple[dict, dict]:
+def prepare_input(name: str, spec: dict) -> tuple[Path, dict]:
+    """Checkout + archive for an input; returns (archive, info for the results file)."""
     repo_dir = ensure_repo(name, spec)
     archive, meta = ensure_archive(name, spec, repo_dir)
+    info = {"commit": spec["commit"], "files": meta["files"], "source_bytes": meta["source_bytes"],
+            "archive_bytes": meta["archive_bytes"], "srcml_seconds": meta["srcml_seconds"]}
+    return archive, info
+
+
+def run_srcslice(srcslice: Path, archive: Path, out: Path, extra_args: list[str]) -> dict:
+    """One timed srcslice run writing to out (removed first); raises BenchError on failure."""
+    if out.exists():
+        out.unlink()
+    r = time_once([str(srcslice), str(archive), "-o", str(out), *extra_args])
+    r["output_bytes"] = out.stat().st_size if out.exists() else 0
+    return r
+
+
+def bench_input(name: str, spec: dict, srcslice: Path, extra_args: list[str],
+                repeat: int, verify: bool, diff_limit: int) -> tuple[dict, dict]:
+    archive, info = prepare_input(name, spec)
     out_dir = CACHE_DIR / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{name}.json"
-    cmd = [str(srcslice), str(archive), "-o", str(out), *extra_args]
 
-    info = {"commit": spec["commit"], "files": meta["files"], "source_bytes": meta["source_bytes"],
-            "archive_bytes": meta["archive_bytes"], "srcml_seconds": meta["srcml_seconds"]}
     runs = []
     for i in range(repeat):
-        if out.exists():
-            out.unlink()
         try:
-            r = time_once(cmd)
+            r = run_srcslice(srcslice, archive, out, extra_args)
         except BenchError as e:
             log(f"{name}: FAILED on run {i + 1}/{repeat}: {str(e).splitlines()[0]}")
             return info, {"repeat": repeat, "error": str(e), "runs": runs}
-        r["output_bytes"] = out.stat().st_size if out.exists() else 0
         runs.append(r)
         log(f"{name}: run {i + 1}/{repeat}  wall {r['wall_s']:.2f} s  max RSS {r['maxrss_mb']:.0f} MB")
 
@@ -355,7 +372,42 @@ def bench_input(name: str, spec: dict, srcslice: Path, extra_args: list[str],
         "output_bytes": runs[-1]["output_bytes"],
         "runs": runs,
     }
+    if verify:
+        result["output_check"] = check_timed_output(name, spec, srcslice, archive, out, extra_args, diff_limit)
     return info, result
+
+
+def check_timed_output(name: str, spec: dict, srcslice: Path, archive: Path, out: Path,
+                       extra_args: list[str], diff_limit: int) -> dict | None:
+    """Verify the last timed output against the golden.
+
+    A multithreaded output that differs is re-checked with a single-threaded run, since
+    only that one is reproducible; the number of files the threaded run got differently
+    is reported alongside.
+    """
+    golden = load_golden(name)
+    if golden is None:
+        return None
+    run_args = verify_args(extra_args)
+    warn_golden_mismatch(name, golden, spec, run_args)
+    v = verify_output(name, out, golden, diff_limit)
+    if v["status"] != "mismatch" or extra_args == run_args:
+        log(f"{name}: output {check_label(v)}")
+        return v
+    log(f"{name}: threaded output differs in {v['changed_files']} file(s); re-checking with {shlex.join(run_args)}")
+    out1 = out.with_name(f"{name}.single-thread.json")
+    try:
+        run_srcslice(srcslice, archive, out1, run_args)
+    except BenchError as e:
+        log(f"{name}: single-threaded check run FAILED: {str(e).splitlines()[0]}")
+        v["single_thread_error"] = str(e)
+        return v
+    v1 = verify_output(name, out1, golden, diff_limit)
+    v1["threaded_changed_files"] = v["changed_files"]
+    if v1["status"] == "ok":
+        v1["status"] = "ok-single-thread"
+    log(f"{name}: output {check_label(v1)}")
+    return v1
 
 
 def detect_threads(extra_args: list[str]) -> int:
@@ -451,10 +503,12 @@ def print_summary(result: dict, markdown: bool) -> None:
         rows.append([name, f"{i['files']:,}", fmt_bytes(i["source_bytes"]), fmt_bytes(i["archive_bytes"]),
                      f"{i['srcml_seconds']:.1f} s", str(r["repeat"]), fmt_s(r["wall_median_s"]),
                      fmt_s(r["wall_min_s"]), fmt_s(r["user_s"]), fmt_s(r["sys_s"]),
-                     fmt_mb(r["maxrss_mb"]), fmt_bytes(r["output_bytes"])])
+                     fmt_mb(r["maxrss_mb"]), fmt_bytes(r["output_bytes"]),
+                     check_label(r.get("output_check")) if "output_check" in r else "skipped"])
     if rows:
         print(fmt_table(["input", "files", "source", "archive", "srcml", "runs", "wall median",
-                         "wall min", "user", "sys", "max RSS", "output"], rows, markdown))
+                         "wall min", "user", "sys", "max RSS", "output", "output check"], rows, markdown,
+                        left_cols={0, 12}))
     for name in failed:
         r, i = result["results"][name], result["inputs"][name]
         print(f"\n{name}: FAILED ({i['files']:,} files, {fmt_bytes(i['archive_bytes'])} srcML) "
@@ -561,12 +615,375 @@ def history(markdown: bool, threshold: float) -> None:
                         rows, markdown, left_cols={0, 7}))
 
 
+# ----------------------------------------------------------------------------- output verification
+#
+# Golden outputs: golden/<input>.json (committed) holds per-file hashes of the canonical
+# form of srcslice's output for that input; cache/golden/<input>.canon.gz (ignored) keeps
+# the full canonical output so a mismatch can be explained entry by entry.
+#
+# srcslice's output is only reproducible single-threaded: with several threads the
+# interprocedural pass sees units in a timing-dependent order and use/call sets change
+# from run to run. Goldens are therefore recorded and checked with `-t 1` unless the
+# caller picks a thread count explicitly.
+
+GOLDEN_DIR = BENCH_DIR / "golden"
+GOLDEN_CACHE_DIR = CACHE_DIR / "golden"
+CANON_FORMAT = 1
+# fields whose arrays come from std::set in srcslice: compared as sets, not sequences
+SET_FIELDS = {"dependence", "aliases", "calls", "use", "definition", "controlEdges"}
+ENTRY_KEY_RE = re.compile(r'^"(.*)":\{$')
+FILE_LINE_RE = re.compile(r'^\s*"file"\s*:\s*"(.*)"\s*,?$')
+
+
+class OutputLayoutError(Exception):
+    """The output does not have the line layout the entry splitter understands."""
+
+
+def golden_path(name: str) -> Path:
+    return GOLDEN_DIR / f"{name}.json"
+
+
+def golden_canon_path(name: str) -> Path:
+    return GOLDEN_CACHE_DIR / f"{name}.canon.gz"
+
+
+def golden_canon_meta_path(name: str) -> Path:
+    return GOLDEN_CACHE_DIR / f"{name}.canon.meta.json"
+
+
+def load_golden(name: str) -> dict | None:
+    p = golden_path(name)
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def iter_entries(path: Path):
+    """Yield (key, field lines) for every top-level entry of a srcslice output file.
+
+    Streams line by line (outputs reach gigabytes) and relies on the writer's layout:
+    one `"key":{` line per entry, indented field lines, a `},` or `}` closer. json.load
+    would not do anyway: keys repeat and some strings contain unescaped quotes.
+    """
+    key, buf = None, []
+    with path.open(encoding="utf-8", errors="surrogateescape") as f:
+        for ln, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if key is None:
+                m = ENTRY_KEY_RE.match(line)
+                if m:
+                    key, buf = m.group(1), []
+                elif line not in ("{", "}", ""):
+                    raise OutputLayoutError(f"{path}:{ln}: unexpected line {line[:80]!r}")
+            elif line in ("},", "}"):
+                yield key, buf
+                key = None
+            else:
+                buf.append(line)
+    if key is not None:
+        raise OutputLayoutError(f"{path}: unterminated entry {key!r}")
+
+
+def canonical_entry(key: str, lines: list[str]) -> tuple[str, str, bool]:
+    """(file, canonical text, parsed) for one entry.
+
+    Parsed entries are re-serialized with sorted keys and sorted set-like arrays, so a
+    change in formatting or in element order is not an output change. Entries that are
+    not valid JSON (srcslice does not escape quotes in names such as `operator "" _a`)
+    fall back to their stripped text.
+    """
+    file = ""
+    for l in lines:
+        m = FILE_LINE_RE.match(l)
+        if m:
+            file = m.group(1)
+            break
+    try:
+        obj = json.loads("{" + "\n".join(lines) + "}")
+    except json.JSONDecodeError:
+        return file, key + "\tRAW\t" + "\\n".join(l.strip() for l in lines), False
+    if isinstance(obj.get("file"), str):
+        file = obj["file"]
+    for k, v in obj.items():
+        if k in SET_FIELDS and isinstance(v, list):
+            obj[k] = sorted(v, key=lambda e: json.dumps(e, sort_keys=True))
+    return file, key + "\t" + json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False), True
+
+
+def utf8(s: str) -> bytes:
+    return s.encode("utf-8", "surrogateescape")
+
+
+def digest_output(path: Path, canon_out=None) -> dict:
+    """Per-file and overall hashes of an output's canonical form.
+
+    Hashes are over sorted per-entry digests, so the nondeterministic key order of the
+    output is invisible. With canon_out, also writes `<file>\\t<canonical entry>` lines.
+    """
+    per_file: dict[str, list[bytes]] = {}
+    entries = unparsed = 0
+    for key, lines in iter_entries(path):
+        file, canon, ok = canonical_entry(key, lines)
+        entries += 1
+        unparsed += not ok
+        per_file.setdefault(file, []).append(hashlib.sha256(utf8(canon)).digest())
+        if canon_out is not None:
+            canon_out.write(utf8(file + "\t" + canon + "\n"))
+    files = {}
+    for file in sorted(per_file):
+        digests = sorted(per_file[file])
+        files[file] = f"{hashlib.sha256(b''.join(digests)).hexdigest()[:16]}:{len(digests)}"
+    overall = hashlib.sha256(utf8("\n".join(f"{f}\t{v}" for f, v in files.items()))).hexdigest()
+    return {"canon_format": CANON_FORMAT, "entries": entries, "unparsed_entries": unparsed,
+            "files": len(files), "sha256": overall, "per_file": files}
+
+
+def canon_entries_for(name: str, out_path: Path, files: set[str], golden: dict) -> tuple[dict, dict] | None:
+    """{file: [canonical entries]} for `files`, from the cached golden and from out_path.
+
+    None when the cached golden output is missing or belongs to another golden.
+    """
+    canon, meta = golden_canon_path(name), golden_canon_meta_path(name)
+    if not (canon.exists() and meta.exists()):
+        return None
+    if json.loads(meta.read_text()).get("sha256") != golden["sha256"]:
+        return None
+    g: dict[str, list[str]] = {f: [] for f in files}
+    f_: dict[str, list[str]] = {f: [] for f in files}
+    with gzip.open(canon, "rb") as fh:
+        for raw in fh:
+            file, _, entry = raw.decode("utf-8", "surrogateescape").rstrip("\n").partition("\t")
+            if file in g:
+                g[file].append(entry)
+    for key, lines in iter_entries(out_path):
+        file, entry, _ = canonical_entry(key, lines)
+        if file in f_:
+            f_[file].append(entry)
+    return g, f_
+
+
+def field_diff(key: str, old: str, new: str) -> list[str]:
+    """Readable difference between two canonical entries with the same key."""
+    oj, nj = old.split("\t", 1)[1], new.split("\t", 1)[1]
+    if oj.startswith("RAW\t") or nj.startswith("RAW\t"):
+        return [f"~ {key}", f"    - {oj[:240]}", f"    + {nj[:240]}"]
+    oo, no = json.loads(oj), json.loads(nj)
+    out = [f"~ {key}"]
+    for field in sorted(set(oo) | set(no)):
+        ov, nv = oo.get(field), no.get(field)
+        if ov == nv:
+            continue
+        if isinstance(ov, list) and isinstance(nv, list):
+            oc = collections.Counter(json.dumps(e, sort_keys=True) for e in ov)
+            nc = collections.Counter(json.dumps(e, sort_keys=True) for e in nv)
+            rem, add = sorted((oc - nc).elements()), sorted((nc - oc).elements())
+            out.append(f"    {field}: -{len(rem)} +{len(add)}")
+            out += [f"      - {e}" for e in rem[:5]] + [f"      + {e}" for e in add[:5]]
+            if len(rem) > 5 or len(add) > 5:
+                out.append("      ...")
+        else:
+            out.append(f"    {field}: {json.dumps(ov, ensure_ascii=False)} -> {json.dumps(nv, ensure_ascii=False)}")
+    return out
+
+
+def entry_diff_lines(old_entries: list[str], new_entries: list[str]) -> list[str]:
+    """Differences between the canonical entries of one file, paired by key."""
+    oc, nc = collections.Counter(old_entries), collections.Counter(new_entries)
+    by_key_old: dict[str, list[str]] = {}
+    by_key_new: dict[str, list[str]] = {}
+    for e in sorted((oc - nc).elements()):
+        by_key_old.setdefault(e.split("\t", 1)[0], []).append(e)
+    for e in sorted((nc - oc).elements()):
+        by_key_new.setdefault(e.split("\t", 1)[0], []).append(e)
+    lines: list[str] = []
+    for key in sorted(set(by_key_old) | set(by_key_new)):
+        olds, news = by_key_old.get(key, []), by_key_new.get(key, [])
+        for o, n in zip(olds, news):
+            lines += field_diff(key, o, n)
+        lines += [f"- {key}  (entry gone)" for _ in olds[len(news):]]
+        lines += [f"+ {key}  (new entry)" for _ in news[len(olds):]]
+    return lines
+
+
+def verify_output(name: str, out_path: Path, golden: dict, diff_limit: int) -> dict:
+    """Digest out_path and compare with the golden; on mismatch write cache/out/<name>.verify.txt."""
+    t0 = time.perf_counter()
+    try:
+        fresh = digest_output(out_path)
+    except OutputLayoutError as e:
+        return {"status": "unreadable", "detail": str(e)}
+    g, f = golden["per_file"], fresh["per_file"]
+    changed = sorted(x for x in g if x in f and g[x] != f[x])
+    removed = sorted(x for x in g if x not in f)
+    added = sorted(x for x in f if x not in g)
+    res = {"status": "ok" if fresh["sha256"] == golden["sha256"] else "mismatch",
+           "entries": fresh["entries"], "files": fresh["files"], "unparsed_entries": fresh["unparsed_entries"],
+           "changed_files": len(changed), "added_files": len(added), "removed_files": len(removed),
+           "digest_s": round(time.perf_counter() - t0, 2)}
+    if res["status"] == "ok":
+        return res
+
+    lines = [f"{name}: output differs from {rel(golden_path(name))} "
+             f"(recorded {golden['created'][:10]} with srcslice {golden['srcslice']['commit'][:9]})",
+             f"  files: {len(changed)} changed, {len(added)} added, {len(removed)} removed;"
+             f" entries {golden['entries']:,} -> {fresh['entries']:,}"]
+    lines += [f"+ file {x} ({f[x].split(':')[1]} entries)" for x in added[:diff_limit]]
+    lines += [f"- file {x} ({g[x].split(':')[1]} entries)" for x in removed[:diff_limit]]
+    if changed:
+        shown = set(changed[:diff_limit])
+        pair = canon_entries_for(name, out_path, shown, golden)
+        if pair is None:
+            lines.append("~ changed files: " + ", ".join(changed[:diff_limit]))
+            lines.append(f"  (no local copy of the golden output in {rel(golden_canon_path(name))}; "
+                         f"entry-level diff unavailable. --save-golden --force on the golden commit recreates it.)")
+        else:
+            old, new = pair
+            for x in sorted(shown):
+                lines.append(f"~ file {x}")
+                lines += ["  " + l for l in entry_diff_lines(old[x], new[x])]
+        if len(changed) > diff_limit:
+            lines.append(f"  ... {len(changed) - diff_limit} more changed file(s); raise --diff-limit to see them")
+    report = out_path.with_name(f"{name}.verify.txt")
+    report.write_text("\n".join(lines) + "\n")
+    res["report"] = str(report)
+    return res
+
+
+def save_golden(name: str, spec: dict, out_path: Path, meta: dict, note: str, run_args: list[str]) -> dict:
+    """Write golden/<name>.json and the cached canonical output for out_path."""
+    GOLDEN_DIR.mkdir(exist_ok=True)
+    GOLDEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    canon = golden_canon_path(name)
+    tmp = canon.with_name(canon.name + ".tmp")
+    with gzip.open(tmp, "wb", compresslevel=3) as fh:
+        digest = digest_output(out_path, canon_out=fh)
+    tmp.replace(canon)
+    golden_canon_meta_path(name).write_text(json.dumps({"sha256": digest["sha256"]}) + "\n")
+    manifest = {
+        "input": name,
+        "input_commit": spec["commit"],
+        "created": meta["timestamp"],
+        "note": note,
+        "version": meta["version"],
+        "srcslice": {k: meta["srcslice"][k] for k in ("commit", "dirty", "build_type")},
+        "srcslice_args": run_args,
+        **digest,
+    }
+    golden_path(name).write_text(json.dumps(manifest, indent=1) + "\n")
+    return manifest
+
+
+def has_thread_arg(extra_args: list[str]) -> bool:
+    return any(a in ("-t", "--threads") or a.startswith("--threads=") or (a.startswith("-t") and a[2:].isdigit())
+               for a in extra_args)
+
+
+def verify_args(extra_args: list[str]) -> list[str]:
+    """Arguments for a reproducible run: the caller's, plus -t 1 unless a thread count was given."""
+    return extra_args if has_thread_arg(extra_args) else [*extra_args, "-t", "1"]
+
+
+def check_label(c: dict | None) -> str:
+    if c is None:
+        return "—"
+    s = c["status"]
+    if s == "ok":
+        return "ok"
+    if s == "ok-single-thread":
+        return f"ok (-t 1); threaded run differs in {c['threaded_changed_files']} file(s)"
+    if s == "mismatch":
+        return f"MISMATCH ({c['changed_files']} changed, {c['added_files']} added, {c['removed_files']} removed)"
+    if s == "unreadable":
+        return "unreadable output"
+    return s
+
+
+def warn_golden_mismatch(name: str, golden: dict, spec: dict, run_args: list[str]) -> None:
+    if golden["input_commit"] != spec["commit"]:
+        log(f"warning: {name} golden was recorded for input commit {golden['input_commit'][:12]}, "
+            f"this run uses {spec['commit'][:12]}; differences are expected")
+    if golden.get("srcslice_args") != run_args:
+        log(f"warning: {name} golden was recorded with srcslice args {shlex.join(golden.get('srcslice_args', []))!r}, "
+            f"this run uses {shlex.join(run_args)!r}")
+
+
+def verify_main(args: argparse.Namespace, inputs: dict, sizes: list[str], extra_args: list[str],
+                srcslice: Path, meta: dict, markdown: bool) -> int:
+    """--verify / --save-golden: one single-threaded run per input, checked against or recorded as golden."""
+    out_dir = CACHE_DIR / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_args = verify_args(extra_args)
+    if args.save_golden:
+        if args.sizes == "all":
+            # don't spend an hour on an input the baseline already shows cannot finish (x-large OOM)
+            latest = list_baselines()[-1][1]["results"] if list_baselines() else {}
+            broken = [n for n in sizes if "error" in latest.get(n, {})]
+            for n in broken:
+                log(f"skipping {n}: the latest baseline records a failure for it (pass --sizes {n} to insist)")
+            sizes = [n for n in sizes if n not in broken]
+        for name in sizes:
+            if golden_path(name).exists() and not args.force:
+                die(f"{rel(golden_path(name))} exists; use --force to replace it")
+        if meta["srcslice"]["dirty"]:
+            log("warning: recording goldens from a srcslice build with uncommitted changes")
+    rows, failed, mismatched, reports = [], [], [], []
+    for name in sizes:
+        spec = inputs[name]
+        golden = load_golden(name)
+        if golden is None and not args.save_golden:
+            log(f"{name}: no golden recorded ({rel(golden_path(name))} missing); run --save-golden --sizes {name}")
+            rows.append([name, "—", "—", "—", "no golden"])
+            continue
+        archive, info = prepare_input(name, spec)
+        out = out_dir / f"{name}.json"
+        log(f"{name}: running srcslice {shlex.join(run_args)} ({info['files']:,} files)")
+        try:
+            r = run_srcslice(srcslice, archive, out, run_args)
+        except BenchError as e:
+            log(f"{name}: FAILED: {str(e).splitlines()[0]}")
+            print("  " + str(e).replace("\n", "\n  "), file=sys.stderr)
+            failed.append(name)
+            rows.append([name, "—", "—", "—", "FAILED"])
+            continue
+        if args.save_golden:
+            m = save_golden(name, spec, out, meta, args.note, run_args)
+            log(f"{name}: golden saved to {rel(golden_path(name))} "
+                f"({m['entries']:,} entries in {m['files']:,} files, {m['unparsed_entries']} kept as text)")
+            rows.append([name, f"{m['entries']:,}", f"{m['files']:,}", fmt_s(r["wall_s"]), "golden saved"])
+            continue
+        warn_golden_mismatch(name, golden, spec, run_args)
+        v = verify_output(name, out, golden, args.diff_limit)
+        label = check_label(v)
+        if v["status"] != "ok":
+            mismatched.append(name)
+            if "report" in v:
+                reports.append(v["report"])
+            if "detail" in v:
+                log(f"{name}: {v['detail']}")
+        rows.append([name, f"{v.get('entries', 0):,}", f"{v.get('files', 0):,}", fmt_s(r["wall_s"]), label])
+        log(f"{name}: {label}")
+    s = meta["srcslice"]
+    print(f"\noutput check  srcslice commit {s['commit'][:9]}{'*' if s['dirty'] else ''}  build {s['build_type']}  "
+          f"args {shlex.join(run_args)}")
+    print(fmt_table(["input", "entries", "files", "wall", "result"], rows, markdown, left_cols={0, 4}))
+    for report in reports:
+        print(f"\n{rel(Path(report))}:")
+        lines = Path(report).read_text().splitlines()
+        print("  " + "\n  ".join(lines[:args.diff_lines]))
+        if len(lines) > args.diff_lines:
+            print(f"  ... {len(lines) - args.diff_lines} more line(s) in the report")
+    if mismatched:
+        log(f"OUTPUT MISMATCH: {', '.join(mismatched)}")
+    if failed:
+        log(f"FAILED inputs: {', '.join(failed)}")
+    return 1 if (failed or mismatched) else 0
+
+
 # ----------------------------------------------------------------------------- main
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="benchmark/run.sh", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sizes", default="all", help="comma list of inputs to run (default: all)")
+    ap.add_argument("--sizes", default="quick",
+                    help="comma list of inputs, quick (default: small,medium,medium-cpp) or all (adds the kernel inputs)")
     ap.add_argument("--repeat", type=int, help="override the per-size repeat count")
     ap.add_argument("--srcslice", help="time this binary instead of building build-release/")
     ap.add_argument("--srcslice-args", default="", help='extra srcslice arguments, e.g. --srcslice-args="-t 8"')
@@ -580,6 +997,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--history", action="store_true", help="print all baseline versions and exit")
     ap.add_argument("--format", choices=["text", "markdown"], default="text")
     ap.add_argument("--update-inputs", action="store_true", help="re-pin inputs.json to the branch heads and exit")
+    g = ap.add_argument_group("output regression", "the slice output is checked against golden/<input>.json")
+    g.add_argument("--verify", action="store_true", help="run each input once (single-threaded), check its output and exit")
+    g.add_argument("--save-golden", action="store_true", help="record the current output as the golden for the selected inputs (--force to replace)")
+    g.add_argument("--no-verify", action="store_true", help="skip the output check after the timing runs")
+    g.add_argument("--diff-limit", type=int, default=10, help="files detailed in a mismatch report (default 10)")
+    g.add_argument("--diff-lines", type=int, default=40, help="report lines echoed to the console (default 40)")
     args = ap.parse_args(argv)
     markdown = args.format == "markdown"
 
@@ -591,7 +1014,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     inputs = load_inputs()
-    sizes = list(inputs) if args.sizes == "all" else [s.strip() for s in args.sizes.split(",") if s.strip()]
+    if args.sizes == "all":
+        sizes = list(inputs)
+    elif args.sizes == "quick":
+        sizes = [n for n in QUICK_SIZES if n in inputs]
+    else:
+        sizes = [s.strip() for s in args.sizes.split(",") if s.strip()]
     unknown = [s for s in sizes if s not in inputs]
     if unknown:
         die(f"unknown input(s) {unknown}; choose from {list(inputs)}")
@@ -601,6 +1029,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.save_baseline:
             die("--bump requires --save-baseline")
         version = bump_version(version, args.bump)
+    if (args.verify or args.save_golden) and (args.save_baseline or args.compare_to or args.repeat):
+        die("--verify/--save-golden do not time anything; drop --save-baseline/--compare-to/--repeat")
     if args.save_baseline:
         target = baseline_path(version)
         if target.exists() and not args.force:
@@ -621,6 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
         "srcslice_args": extra_args,
         "threads": detect_threads(extra_args),
     }
+    if args.verify or args.save_golden:
+        return verify_main(args, inputs, sizes, extra_args, srcslice, meta, markdown)
     if meta["srcslice"]["build_type"].lower() != "release":
         log(f"warning: srcslice build type is {meta['srcslice']['build_type']!r}, not Release")
 
@@ -628,7 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in sizes:
         repeat = args.repeat or DEFAULT_REPEAT.get(name, 3)
         result["inputs"][name], result["results"][name] = bench_input(
-            name, inputs[name], srcslice, extra_args, repeat)
+            name, inputs[name], srcslice, extra_args, repeat, not args.no_verify, args.diff_limit)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_file = RESULTS_DIR / (meta["timestamp"].replace("-", "").replace(":", "") + ".json")
@@ -662,9 +1094,20 @@ def main(argv: list[str] | None = None) -> int:
         target.write_text(json.dumps(to_save, indent=2) + "\n")
         log(f"saved baseline {rel(target)}")
     log(f"results written to {rel(out_file)}")
+    mismatched = [n for n, r in result["results"].items()
+                  if r.get("output_check") and r["output_check"]["status"] not in ("ok", "ok-single-thread")]
+    for n in mismatched:
+        c = result["results"][n]["output_check"]
+        if "report" in c:
+            lines = Path(c["report"]).read_text().splitlines()
+            print(f"\n{rel(Path(c['report']))}:\n  " + "\n  ".join(lines[:args.diff_lines]))
+            if len(lines) > args.diff_lines:
+                print(f"  ... {len(lines) - args.diff_lines} more line(s) in the report")
+    if mismatched:
+        log(f"OUTPUT MISMATCH: {', '.join(mismatched)}")
     if failed:
         log(f"FAILED inputs: {', '.join(failed)}")
-    return 1 if (failed or (regression and args.fail_on_regression)) else 0
+    return 1 if (failed or mismatched or (regression and args.fail_on_regression)) else 0
 
 
 if __name__ == "__main__":

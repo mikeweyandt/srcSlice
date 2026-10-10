@@ -300,6 +300,18 @@ Not performance, but worth a ticket each:
 - srcDispatch `TypeData::copyAs`, `NameData::copyAs`, `ExpressionData::copyAs` cast the
   `DeltaElement` wrapper instead of its value (fixed in this working tree, not yet upstream), and
   srcSAX dereferences a possibly null libxml2 error (same).
+- **Multithreaded output is not reproducible.** Two 32-thread runs on `small` differ in 8 of
+  4,669 entries (fields `use`, `calls`, `definition`), and a 32-thread run differs from a `-t 1`
+  run in 32 entries; `-t 1` is identical run to run. The interprocedural pass (S1) resolves against
+  whatever has been merged so far, so the result depends on unit arrival order, and the
+  `operator<` collision above makes which of two same-line:column positions survives depend on
+  insertion order. The regression goldens in `benchmark/golden/` are therefore recorded with
+  `-t 1`; fixing S1 so that resolution happens once over the complete map should make `-t N`
+  match them.
+- The output is not valid JSON when a name contains a quote: `operator "" _a` is written
+  unescaped (`srcsliceprofile.cpp:102` writes every string with bare `<<`), and duplicate top-level
+  keys occur when identical files appear twice in an archive (same unit hash). 8 entries in `small`
+  are affected; the regression checker compares those as text.
 
 ## Suggested order
 

@@ -69,10 +69,14 @@ is created. While the srcML release is still a GitHub draft, place the tarballs 
 and keeps versioned baselines so performance changes can be compared release to release.
 From the dev container:
 ```bash
-./benchmark/run.sh             # run all three and compare against the latest baseline
+./benchmark/run.sh             # time the quick set (small, medium, medium-cpp), compare with the baseline, check outputs
+./benchmark/run.sh --sizes all # include the kernel inputs (30+ min)
+./benchmark/run.sh --verify    # only check the slice outputs against the recorded goldens
 ./benchmark/run.sh --history   # how every version compares
 ```
-See [benchmark/README.md](benchmark/README.md) for the performance-update workflow.
+Each input has a recorded golden output in `benchmark/golden/`; a timing run and
+`ctest -R regression` fail when a slice no longer matches it. See
+[benchmark/README.md](benchmark/README.md) for the performance-update workflow.
 
 <br>
 

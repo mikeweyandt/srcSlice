@@ -37,6 +37,21 @@ add_subdirectory(src)
 add_subdirectory(test)
 add_subdirectory(srcDispatch)
 
+# Output-regression tests: slice a pinned real codebase and compare the result with the
+# golden output recorded in benchmark/golden/ (see benchmark/README.md). The first run of
+# each size fetches and converts its input, so it needs network access and srcml.
+set(SRCSLICE_REGRESSION_SIZES "small" CACHE STRING
+    "benchmark inputs registered as ctest output-regression tests (semicolon list; empty disables)")
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    foreach(SIZE IN LISTS SRCSLICE_REGRESSION_SIZES)
+        add_test(NAME regression-${SIZE}
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/benchmark/bench.py
+                         --verify --sizes ${SIZE} --srcslice $<TARGET_FILE:srcslice>)
+        set_tests_properties(regression-${SIZE} PROPERTIES LABELS "regression" TIMEOUT 7200)
+    endforeach()
+endif()
+
 # custom make target to strictly test srcSlice test suite
 add_custom_target(test_srcslice
     COMMAND ${CMAKE_CTEST_COMMAND} -L srcslice # only run ctest testcases with the srcslice label attached
