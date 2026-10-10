@@ -37,10 +37,10 @@ CACHE_DIR = BENCH_DIR / "cache"
 RESULTS_DIR = BENCH_DIR / "results"
 RELEASE_BUILD_DIR = ROOT / "build-release"
 
-DEFAULT_REPEAT = {"small": 5, "medium": 3, "medium-cpp": 3, "large": 3, "x-large": 1}
-SIZE_ORDER = ["small", "medium", "medium-cpp", "large", "x-large"]
+DEFAULT_REPEAT = {"small": 5, "small-ca": 5, "medium": 3, "medium-cpp": 3, "large": 3, "x-large": 1}
+SIZE_ORDER = ["small", "small-ca", "medium", "medium-cpp", "large", "x-large"]
 # the default set: the kernel inputs (large, x-large) take 30+ minutes and are run only when named
-QUICK_SIZES = ["small", "medium", "medium-cpp"]
+QUICK_SIZES = ["small", "small-ca", "medium", "medium-cpp"]
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -146,6 +146,11 @@ def update_inputs() -> None:
     if changed:
         INPUTS_FILE.write_text(json.dumps(inputs, indent=2) + "\n")
         log(f"wrote {rel(INPUTS_FILE)}")
+
+
+def input_args(spec: dict) -> list[str]:
+    """Extra srcslice arguments an input is always run with (e.g. -c -a for small-ca)."""
+    return list(spec.get("args", []))
 
 
 def repo_slug(spec: dict) -> str:
@@ -350,6 +355,7 @@ def bench_input(name: str, spec: dict, srcslice: Path, extra_args: list[str],
     out_dir = CACHE_DIR / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{name}.json"
+    extra_args = [*input_args(spec), *extra_args]
 
     runs = []
     for i in range(repeat):
@@ -803,7 +809,96 @@ def entry_diff_lines(old_entries: list[str], new_entries: list[str]) -> list[str
     return lines
 
 
-def verify_output(name: str, out_path: Path, golden: dict, diff_limit: int) -> dict:
+def diff_summary(old: dict[str, list[str]], new: dict[str, list[str]]) -> list[str]:
+    """Aggregate the differences over every file: per set-valued field, how many positions
+    were removed and added, and how many removed ones reappear in another entry with the
+    same variable name ("moved") versus genuinely lost or new. The review instrument for
+    output-changing steps."""
+    removed: collections.Counter = collections.Counter()   # (name, field, value) -> n
+    added: collections.Counter = collections.Counter()
+    field_removed: collections.Counter = collections.Counter()
+    field_added: collections.Counter = collections.Counter()
+    scalar_changed: collections.Counter = collections.Counter()
+    churn: collections.Counter = collections.Counter()
+    counts = collections.Counter()
+
+    def parse(entry: str | None) -> dict | None:
+        if entry is None:
+            return None
+        body = entry.split("\t", 1)[1]
+        if body.startswith("RAW\t"):
+            counts["raw"] += 1
+            return None
+        return json.loads(body)
+
+    def elements(obj: dict | None, field: str) -> collections.Counter:
+        if obj is None or not isinstance(obj.get(field), list):
+            return collections.Counter()
+        return collections.Counter(json.dumps(e, sort_keys=True) for e in obj[field])
+
+    def tally(old_entry: str | None, new_entry: str | None) -> None:
+        oo, no = parse(old_entry), parse(new_entry)
+        if (old_entry and oo is None) or (new_entry and no is None):
+            return
+        name = (oo or no).get("name", "?")
+        for field in sorted(SET_FIELDS):
+            oe, ne = elements(oo, field), elements(no, field)
+            for v, n in (oe - ne).items():
+                removed[(name, field, v)] += n
+                field_removed[field] += n
+                churn[name] += n
+            for v, n in (ne - oe).items():
+                added[(name, field, v)] += n
+                field_added[field] += n
+                churn[name] += n
+        if oo is not None and no is not None:
+            for field in set(oo) | set(no):
+                if field not in SET_FIELDS and oo.get(field) != no.get(field):
+                    scalar_changed[field] += 1
+
+    for file in set(old) | set(new):
+        oc, nc = collections.Counter(old.get(file, [])), collections.Counter(new.get(file, []))
+        by_key_old: dict[str, list[str]] = {}
+        by_key_new: dict[str, list[str]] = {}
+        for e in (oc - nc).elements():
+            by_key_old.setdefault(e.split("\t", 1)[0], []).append(e)
+        for e in (nc - oc).elements():
+            by_key_new.setdefault(e.split("\t", 1)[0], []).append(e)
+        for key in set(by_key_old) | set(by_key_new):
+            olds, news = sorted(by_key_old.get(key, [])), sorted(by_key_new.get(key, []))
+            for o, n in zip(olds, news):
+                counts["changed"] += 1
+                tally(o, n)
+            for o in olds[len(news):]:
+                counts["gone"] += 1
+                tally(o, None)
+            for n in news[len(olds):]:
+                counts["new"] += 1
+                tally(None, n)
+
+    moved_by_field: collections.Counter = collections.Counter()
+    for k, n in removed.items():
+        if k in added:
+            moved_by_field[k[1]] += min(n, added[k])
+    rows = []
+    for field in sorted(SET_FIELDS):
+        r, a, m = field_removed[field], field_added[field], moved_by_field[field]
+        if r or a:
+            rows.append([field, f"{r:,}", f"{a:,}", f"{m:,}", f"{r - m:,}", f"{a - m:,}"])
+    lines = [f"summary over all changed files: {counts['changed']:,} entries changed, "
+             f"{counts['gone']:,} gone, {counts['new']:,} new"
+             + (f", {counts['raw']:,} compared as text" if counts["raw"] else "")]
+    if rows:
+        lines.append("  positions per field (moved = removed from one entry and added to another with the same name):")
+        lines += ["  " + l for l in fmt_table(["field", "removed", "added", "moved", "lost", "new"], rows, False).splitlines()]
+    if scalar_changed:
+        lines.append("  scalar fields changed: " + ", ".join(f"{f} {n:,}" for f, n in scalar_changed.most_common()))
+    if churn:
+        lines.append("  names with the most churn: " + ", ".join(f"{n} ({c:,})" for n, c in churn.most_common(12)))
+    return lines
+
+
+def verify_output(name: str, out_path: Path, golden: dict, diff_limit: int, summary: bool = False) -> dict:
     """Digest out_path and compare with the golden; on mismatch write cache/out/<name>.verify.txt."""
     t0 = time.perf_counter()
     try:
@@ -825,6 +920,13 @@ def verify_output(name: str, out_path: Path, golden: dict, diff_limit: int) -> d
              f"(recorded {golden['created'][:10]} with srcslice {golden['srcslice']['commit'][:9]})",
              f"  files: {len(changed)} changed, {len(added)} added, {len(removed)} removed;"
              f" entries {golden['entries']:,} -> {fresh['entries']:,}"]
+    if summary:
+        pair = canon_entries_for(name, out_path, set(changed) | set(added) | set(removed), golden)
+        if pair is None:
+            lines.append("  (--diff-summary needs the cached golden output; see below)")
+        else:
+            lines += diff_summary(*pair)
+        lines.append("")
     lines += [f"+ file {x} ({f[x].split(':')[1]} entries)" for x in added[:diff_limit]]
     lines += [f"- file {x} ({g[x].split(':')[1]} entries)" for x in removed[:diff_limit]]
     if changed:
@@ -896,11 +998,27 @@ def check_label(c: dict | None) -> str:
     return s
 
 
+def without_thread_args(args: list[str]) -> list[str]:
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in ("-t", "--threads"):
+            skip = True
+            continue
+        if a.startswith("--threads=") or (a.startswith("-t") and a[2:].isdigit()):
+            continue
+        out.append(a)
+    return out
+
+
 def warn_golden_mismatch(name: str, golden: dict, spec: dict, run_args: list[str]) -> None:
     if golden["input_commit"] != spec["commit"]:
         log(f"warning: {name} golden was recorded for input commit {golden['input_commit'][:12]}, "
             f"this run uses {spec['commit'][:12]}; differences are expected")
-    if golden.get("srcslice_args") != run_args:
+    # the thread count must not change the output, so a differing -t is not worth a warning
+    if without_thread_args(golden.get("srcslice_args", [])) != without_thread_args(run_args):
         log(f"warning: {name} golden was recorded with srcslice args {shlex.join(golden.get('srcslice_args', []))!r}, "
             f"this run uses {shlex.join(run_args)!r}")
 
@@ -910,7 +1028,6 @@ def verify_main(args: argparse.Namespace, inputs: dict, sizes: list[str], extra_
     """--verify / --save-golden: one single-threaded run per input, checked against or recorded as golden."""
     out_dir = CACHE_DIR / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
-    run_args = verify_args(extra_args)
     if args.save_golden:
         if args.sizes == "all":
             # don't spend an hour on an input the baseline already shows cannot finish (x-large OOM)
@@ -934,6 +1051,7 @@ def verify_main(args: argparse.Namespace, inputs: dict, sizes: list[str], extra_
             continue
         archive, info = prepare_input(name, spec)
         out = out_dir / f"{name}.json"
+        run_args = verify_args([*input_args(spec), *extra_args])
         log(f"{name}: running srcslice {shlex.join(run_args)} ({info['files']:,} files)")
         try:
             r = run_srcslice(srcslice, archive, out, run_args)
@@ -950,7 +1068,7 @@ def verify_main(args: argparse.Namespace, inputs: dict, sizes: list[str], extra_
             rows.append([name, f"{m['entries']:,}", f"{m['files']:,}", fmt_s(r["wall_s"]), "golden saved"])
             continue
         warn_golden_mismatch(name, golden, spec, run_args)
-        v = verify_output(name, out, golden, args.diff_limit)
+        v = verify_output(name, out, golden, args.diff_limit, args.diff_summary)
         label = check_label(v)
         if v["status"] != "ok":
             mismatched.append(name)
@@ -962,7 +1080,7 @@ def verify_main(args: argparse.Namespace, inputs: dict, sizes: list[str], extra_
         log(f"{name}: {label}")
     s = meta["srcslice"]
     print(f"\noutput check  srcslice commit {s['commit'][:9]}{'*' if s['dirty'] else ''}  build {s['build_type']}  "
-          f"args {shlex.join(run_args)}")
+          f"args {shlex.join(verify_args(extra_args))} (+ per-input args)")
     print(fmt_table(["input", "entries", "files", "wall", "result"], rows, markdown, left_cols={0, 4}))
     for report in reports:
         print(f"\n{rel(Path(report))}:")
@@ -1003,6 +1121,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--no-verify", action="store_true", help="skip the output check after the timing runs")
     g.add_argument("--diff-limit", type=int, default=10, help="files detailed in a mismatch report (default 10)")
     g.add_argument("--diff-lines", type=int, default=40, help="report lines echoed to the console (default 40)")
+    g.add_argument("--diff-summary", action="store_true",
+                   help="on a mismatch, aggregate the differences over all changed files (moved vs lost vs new positions)")
     args = ap.parse_args(argv)
     markdown = args.format == "markdown"
 

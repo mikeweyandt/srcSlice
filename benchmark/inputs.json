@@ -14,6 +14,25 @@
       ".hxx"
     ]
   },
+  "small-ca": {
+    "repo": "https://github.com/srcML/srcSlice.git",
+    "branch": "main",
+    "commit": "61c1a33a57e3c90b67a7cdf05971f13cce0c6aea",
+    "extensions": [
+      ".c",
+      ".h",
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".hh",
+      ".hpp",
+      ".hxx"
+    ],
+    "args": [
+      "-c",
+      "-a"
+    ]
+  },
   "medium": {
     "repo": "https://github.com/postgres/postgres.git",
     "branch": "master",

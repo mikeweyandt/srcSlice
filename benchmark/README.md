@@ -67,15 +67,26 @@ Every input also has a recorded *golden* slice in `golden/<input>.json`, so a pe
 change can be checked for changed results, not just changed timing:
 
 ```bash
-./benchmark/run.sh --verify                          # quick set: slice once each, compare with the goldens (~1 min)
+./benchmark/run.sh --verify                          # quick set: slice once each, compare with the goldens (~2 min)
 ./benchmark/run.sh --verify --sizes small            # just srcSlice itself (a second)
+./benchmark/run.sh --verify --srcslice-args="-t 8"   # the same with 8 threads (must match once merging is deterministic)
 ctest --test-dir build -R regression                 # same check for `small`, wired into ctest
 ```
+
+The quick set is `small`, `small-ca`, `medium` and `medium-cpp`. `small-ca` is the srcSlice
+repository sliced with `-c -a` (control edges and alias expansion; set per input with
+`"args"` in `inputs.json`), so changes to those passes get a golden diff too. It takes about
+25 s today because the control-edge pass is recomputed after every unit (S1 in findings.md).
 
 A timing run checks its last output as well (`output check` column; `--no-verify` skips
 it), and the exit code is 1 whenever an output differs. On a mismatch the console shows
 the first lines of `cache/out/<input>.verify.txt`, which lists the changed files and, per
-changed entry, the fields that differ and the positions added or removed:
+changed entry, the fields that differ and the positions added or removed. Add
+`--diff-summary` to get, at the top of the report, totals over *all* changed files: per
+field, positions removed and added, how many of the removed ones reappear in another entry
+with the same variable name ("moved") and how many are genuinely lost or new, plus the
+names with the most churn. That summary is the review instrument for a change that is
+meant to alter the output:
 
 ```
 ~ file src/backend/parser/parse_expr.c
@@ -152,6 +163,7 @@ Add `--format markdown` to paste either table into a PR.
 --no-verify                  skip the output check after the timing runs
 --diff-limit N               files detailed in a mismatch report (default 10)
 --diff-lines N               report lines echoed to the console (default 40)
+--diff-summary               on a mismatch, aggregate moved / lost / new positions over all changed files
 ```
 
 ## Notes

@@ -33,6 +33,16 @@ include_directories(${LIBXML2_INCLUDE_DIR}
                     srcDispatch/src/policy_classes
                     src/headers)
 
+# Sanitizer builds for the unit tests, e.g.
+#   cmake -S . -B build-tsan -G Ninja -DSRCSLICE_SANITIZER=thread -DCMAKE_BUILD_TYPE=RelWithDebInfo
+#   cmake --build build-tsan && ctest --test-dir build-tsan -L srcslice
+# Applied before the subdirectories so srcDispatch/srcSAX are instrumented as well.
+set(SRCSLICE_SANITIZER "" CACHE STRING "Build with -fsanitize=<address|thread|undefined> (empty = off)")
+if(SRCSLICE_SANITIZER)
+    add_compile_options(-fsanitize=${SRCSLICE_SANITIZER} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${SRCSLICE_SANITIZER})
+endif()
+
 add_subdirectory(src)
 add_subdirectory(test)
 add_subdirectory(srcDispatch)
