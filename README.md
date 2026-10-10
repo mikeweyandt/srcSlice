@@ -64,6 +64,16 @@ Submodules are initialized and CMake is configured into `build/` when the contai
 is created. While the srcML release is still a GitHub draft, place the tarballs in
 `.devcontainer/srcml/` first (see the README in that folder).
 
+### Benchmarks:
+`benchmark/` times `srcslice` on five inputs from four pinned codebases (srcSlice, PostgreSQL, OpenCV, the Linux kernel without and with `drivers/`)
+and keeps versioned baselines so performance changes can be compared release to release.
+From the dev container:
+```bash
+./benchmark/run.sh             # run all three and compare against the latest baseline
+./benchmark/run.sh --history   # how every version compares
+```
+See [benchmark/README.md](benchmark/README.md) for the performance-update workflow.
+
 <br>
 
 ## Using srcSlice

@@ -5,7 +5,11 @@
 # @copyright Copyright (C) 2013-2024 srcML, LLC. (www.srcML.org)
 
 cmake_minimum_required(VERSION 3.20)
-project(srcSlice)
+
+# Project version lives in VERSION (also used by benchmark/ for baseline versioning)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" SRCSLICE_VERSION)
+string(STRIP "${SRCSLICE_VERSION}" SRCSLICE_VERSION)
+project(srcSlice VERSION ${SRCSLICE_VERSION})
 
 # enable ctest
 enable_testing()
