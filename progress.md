@@ -426,19 +426,117 @@ Remaining memory levers, not done: M4 (fragments are full `SliceProfile`s until 
 per element on top of the 32-byte position; sorted vectors built once in `Finalize` would
 halve it), and M7 (the srcDispatch object model) for the transient parse memory.
 
-## Where things stand (v0.1.0 → v0.2.6)
+## Step 3a — S3: dispatcher and SAX per-element plumbing (output-neutral) — done
 
-| input      | wall v0.1.0 | wall v0.2.6 | RSS v0.1.0 | RSS v0.2.6 | output v0.1.0 | output v0.2.6 |
+Baseline **v0.2.7**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 8`), suite 9/9 plus
+the regression test, ThreadSanitizer and AddressSanitizer suites clean.
+
+Profile of v0.2.6 that chose this step (medium, 32 threads, `benchmark/cache/profile/v026/`):
+`-t 1` and `-t 32` both take 12.6 s, so the main thread is the critical path. Of its samples,
+60 % are the parse (libxml2 itself about a third of that; `startElement` 26 %, `endElement`
+11 %, `charactersUnit` 2 %), 20 % `Finalize` (`ResolveCall` 16 %, of which the
+`ParameterProfile` scan is 5 %), 11 % the JSON writer (`StartToString` 5 %). The workers
+together take a third of all samples but run alongside; the merge thread takes 2 %.
+
+What changed, all in the srcDispatch and srcSAX submodules (`srcDispatcher.hpp`,
+`srcDispatchUtilities.hpp`, `sax2_srcsax_handler.{hpp,cpp}`, `cppCallbackAdapter.hpp`,
+`Position.{hpp,cpp}`, `ClassPolicy.hpp`, `FunctionPolicy.hpp`, `ConvertPlexerPolicy.hpp`):
+
+- srcSAX converts each element's attributes and namespaces into arrays owned by the parser
+  state (one value buffer) instead of a `calloc`, a `strndup` per attribute and the matching
+  frees; the strings of the C element stack live in a deque instead of a `calloc`/`free` pair
+  per element; the C++ adapter builds its stack entry in place.
+- The dispatcher builds the qualified tag name in a reused buffer (no `std::string` per
+  element, none per attribute), parses `pos:start`/`pos:end` in place
+  (`Position(const char*)`, falling back to the string constructor for anything that is not
+  `digits:digits`), resolves the handlers of the `unit`, `tokenstring` and `xmlattribute`
+  events once instead of hashing the literal for every element or text node, and exposes the
+  attribute list through `ctx.GetAttribute(name)` instead of filling and clearing a
+  `std::map<std::string, std::string>` per element (`ctx.attributes` is gone; the two
+  stereotype readers use the accessor).
+- Events nobody listens to are not dispatched: the per-attribute `xmlattribute` event (no
+  policy here handles it: about 21 M empty dispatches on medium) and the `tokenstring` event
+  when the listener in charge has no text handler. `EventListener::HasOpenHandler` /
+  `HasCloseHandler` answer that; the srcDiff plexer, which forwards events itself, overrides
+  them to always say yes.
+
+| input      | v0.2.6 wall | v0.2.7 wall | Δ wall | v0.2.6 RSS | v0.2.7 RSS |
+|------------|------------:|------------:|-------:|-----------:|-----------:|
+| small      |     0.193 s |     0.144 s |  -25 % |      51 MB |      54 MB |
+| small-ca   |     0.273 s |     0.253 s |   -8 % |      50 MB |      54 MB |
+| medium     |      12.8 s |      10.8 s |  -15 % |   1,242 MB |   1,244 MB |
+| medium-cpp |      20.7 s |      18.5 s |  -11 % |   1,747 MB |   1,747 MB |
+
+User time on medium fell from 14.4 s to 12.4 s; the parse phase from 8.1 s to about 6 s.
+
+The srcDispatch submodule's own 27 tests (`testCall` … `testWhile`) cannot run in the dev
+container: they shell out to `srcdiff`, which is not installed, and fail identically on the
+pre-change build. The gate for submodule changes is therefore the srcslice suites, the
+regression test, the goldens and the sanitizers.
+
+## Step 3b — S4: policy data handed over by move, plus a ControlPolicy fix — done
+
+Baseline **v0.2.8**. Suite 9/9 plus the regression test, ThreadSanitizer and AddressSanitizer
+suites clean; goldens re-recorded for the bug fix below (review follows) and `--verify` exact
+with `-t 8` against them. Phase split on medium afterwards: parse 6.05 s, `Finalize` 2.5 s,
+10.4 s in all.
+
+What changed (srcDispatch `srcDispatchUtilities.hpp`, the 28 policies, `ControlPolicy.hpp`):
+
+- `PolicyDispatcher::HandOver(data)` replaces `std::make_shared<T>(data)` in every policy's
+  `DataInner()` except the srcDiff plexer's: the struct is moved into the `shared_ptr` on the
+  first `Data<T>()` request of a `NotifyAll` and later requests of the same `NotifyAll` get the
+  same pointer; `NotifyAll` forgets it afterwards. Before, every request deep-copied the struct
+  (a `NameData` or `ExpressionData` with its vectors of `std::any`, and the whole `UnitData`
+  tree once per unit on the parse thread). Audit before the change: every policy assigns a
+  fresh `data` in its open handler before reading it, and each has one listener.
+- The move exposed a bug the copies had hidden. `ControlPolicy`'s `<control>` close handler was
+  missing the `return` after `if(!depth || depth != ctx.depth)`, so `depth = 0` was the body of
+  the `if` and a normal close never reset `depth`; the next `<control>` open was ignored and
+  that loop was handed the previous loop's `ControlData` (init/condition/incr overwritten by
+  the new loop's children for a classic `for`, kept for a range-based `for`, start/end
+  positions always stale). The policy objects live for the whole archive, so the stale data
+  crossed units. With the move the second hand-over dereferenced a null `ConditionData`
+  (found by bisecting the small archive down to a classic `for` followed by a range-based `for`
+  in a later function). Fixed by the `return`.
+
+Golden review (`--verify --diff-summary` before re-recording):
+
+| input      | entries changed | removed                           | added | what the diff is |
+|------------|----------------:|-----------------------------------|------:|------------------|
+| small      |       1 / 4,669 | 1 use                             |     0 | `m_str` declared at catch.hpp:3545 loses the use at catch.hpp:15513:41, the condition of a loop in `XmlEncode::encodeTo` (another class's `m_str`) |
+| small-ca   |       1 / 4,669 | 1 use                             |     0 | the same entry |
+| medium     |               0 | —                                 |     — | C code, no range-based loops |
+| medium-cpp |    22 / 243,246 | 68 calls, 11 definitions, 90 uses |     1 | every removed position is in a different file than its entry (e.g. `d` of test_intrin_utils.hpp:160 with uses at ccm/operations.cpp:62); the one addition re-attributes a use of `layers` (net_impl.hpp:102) from op_timvx.cpp:508:68 to net_openvino.cpp:508:68, the file whose loop it is |
+
+| input      | v0.2.7 wall | v0.2.8 wall | Δ wall | v0.2.7 RSS | v0.2.8 RSS |
+|------------|------------:|------------:|-------:|-----------:|-----------:|
+| small      |     0.144 s |     0.136 s |   -6 % |      54 MB |      54 MB |
+| small-ca   |     0.253 s |     0.234 s |   -7 % |      54 MB |      54 MB |
+| medium     |      10.8 s |      11.0 s |   +1 % |   1,244 MB |   1,243 MB |
+| medium-cpp |      18.5 s |      18.5 s |    0 % |   1,747 MB |   1,747 MB |
+
+Neutral on the medium inputs within run-to-run noise (medium's fastest run was 10.7 s): the
+per-close copies were not among the parse thread's hot spots once S3 had removed the plumbing
+around them. Kept because it removes a copy of the whole unit model per unit on the parse
+thread and the allocation churn of the per-close copies, both of which grow with unit size;
+it can be reverted independently of the `ControlPolicy` fix (one line) if the moved-from
+state of a policy's `data` between close and the next open is unwanted.
+
+## Where things stand (v0.1.0 → v0.2.8)
+
+| input      | wall v0.1.0 | wall v0.2.8 | RSS v0.1.0 | RSS v0.2.8 | output v0.1.0 | output v0.2.8 |
 |------------|------------:|------------:|-----------:|-----------:|--------------:|--------------:|
-| small      |     0.202 s |     0.193 s |      78 MB |      51 MB |        3.6 MB |        4.4 MB |
-| small-ca   |      22.0 s |     0.273 s |      81 MB |      50 MB |        4.7 MB |        5.7 MB |
-| medium     |      24.3 s |      12.8 s |   3,021 MB |   1,242 MB |      265.4 MB |      941.6 MB |
-| medium-cpp |      31.2 s |      20.7 s |   3,973 MB |   1,747 MB |      399.9 MB |       1.69 GB |
+| small      |     0.202 s |     0.136 s |      78 MB |      54 MB |        3.6 MB |        4.4 MB |
+| small-ca   |      22.0 s |     0.234 s |      81 MB |      54 MB |        4.7 MB |        5.7 MB |
+| medium     |      24.3 s |      11.0 s |   3,021 MB |   1,243 MB |      265.4 MB |      941.6 MB |
+| medium-cpp |      31.2 s |      18.5 s |   3,973 MB |   1,747 MB |      399.9 MB |       1.69 GB |
 
 (small-ca's v0.1.0 figure is its first measurement, taken with the Step 0 binary.) The slices
 now contain the complete transitive closure through the call graph, which is 3.5-4× more data
-than before, computed in about half the time and 60 % of the memory. The output itself is the
-largest remaining cost on the medium inputs: 942 MB and 1.7 GB of JSON written per run.
-Threaded runs are reproducible and identical to `-t 1`; a run with a failing unit reports the
-unit instead of aborting the process; `-c -a` costs a fraction of a second on small instead of
-22 s.
+than before, computed in 40-45 % of the time and 40-60 % of the memory. On medium the parse
+thread remains the critical path (about 6 s of the 11 s, libxml2 itself about 2 s of that),
+then `Finalize` (2.5 s) and the 942 MB JSON (1.5 s); `-t 1` and `-t 32` still take the same
+time. Threaded runs are reproducible and identical to `-t 1`; a run with a failing unit
+reports the unit instead of aborting the process; `-c -a` costs a fraction of a second on
+small instead of 22 s.

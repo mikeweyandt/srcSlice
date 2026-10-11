@@ -74,6 +74,9 @@ failing worker or a broken archive throws `std::runtime_error` out of the constr
 tagged `[!mayfail]` describe intended behaviour that a known defect still breaks; Catch
 reports them without failing the suite, and the comment above each names the change expected
 to fix it. `progress.md` logs each performance step with its gate results and numbers.
+The srcDispatch submodule's own suite (`testCall` … `testWhile`, 27 tests) shells out to
+`srcdiff`, which the dev container does not have, so those fail there; `-L srcslice` selects
+the tests that run.
 
 Sanitizer builds instrument srcSlice and the srcDispatch/srcSAX submodules. Each instrumented
 compile of the handler peaks at about 1.3 GB, so keep the job count small on a desktop:
