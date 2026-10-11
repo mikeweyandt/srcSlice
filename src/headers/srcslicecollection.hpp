@@ -106,6 +106,15 @@ public:
     std::string StartToString() const;
     std::string EndToString() const;
 
+    // the same text as StartToString()/EndToString(), written straight into the stream (the
+    // JSON writer emits millions of positions; building a std::string for each was half of
+    // the output phase on medium)
+    void WriteStart(std::ostream& out) const;
+    void WriteEnd(std::ostream& out) const;
+    // the same text appended to a buffer
+    void AppendStart(std::string& out) const;
+    void AppendEnd(std::string& out) const;
+
     std::string RangeToString() const;
     std::string ToNameString() const;
 
@@ -118,6 +127,9 @@ public:
 
     // the interned path ("" for a default-constructed position); valid for the whole process
     const std::string& GetFileName() const;
+    // the interned pointer itself (nullptr without a file name): equal texts share one pointer,
+    // so it serves as a hash key
+    const std::string* FilePtr() const { return file; }
     PositionMeta& GetData();
     const PositionMeta& GetData() const { return data; }
 
