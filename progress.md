@@ -140,3 +140,104 @@ The clean number for 1b can only be taken once nothing depends on `partial` any 
 **Decision: reorder.** Apply 2a1 (write into the profile being resolved) and 2b (resolve once
 in `Finalize`, delete the `partial` gating) first; then 1b is a pure refactor again and its
 gate is "goldens unchanged". Nothing else in the plan changes.
+
+## Step 2a — resolution write target and recursion target (output change, reviewed) — done
+
+Baseline **v0.2.1**. Goldens re-recorded (`--save-golden --force --note "2a: ..."`).
+Combines the plan's 2a1 and 2a2 because 2a1 alone cannot be reviewed on its own (below).
+
+What changed (`src/cpp/srcslicehandler.cpp`):
+
+- `ResolveCall` writes the callee parameter's data into the profile being resolved (`sp`),
+  not into `profileMap[sp.variableName].back()`, the last profile that happens to share the
+  name (Bug A). The callee parameter's own calls are appended to `sp` after the loop.
+- `ArgumentProfile` is replaced by `ParameterProfile(signature, index, functionName)`, which
+  returns the parameter's own profile (declared, same simple function name, declared in the
+  signature's file at the parameter's position) or nullptr. `ResolveCall` resolves that
+  profile first (recursion, cycle-guarded by `visited`) and copies from it directly; the old
+  code pre-resolved `.back()` of *every* parameter name of the signature and then scanned
+  for the real one.
+- `UpdateCalls` loses two dead scans (their result was never used; their only effect was the
+  `.back()` pre-resolution). The overload branch keeps its rule "a candidate signature is
+  accepted only if its parameter profile exists", now through `ParameterProfile`.
+
+Tests: three `testInterprocedural` cases lost their `[!mayfail]`: same variable name in two
+callers, data lands in the resolved parameter (both 2a1), and the two-hop case through a
+non-last parameter (planned for 2a2). Still `[!mayfail]`: the three 2b cases (callee later
+passes the parameter on, header global, mutual recursion), "argument named like the
+parameter", and the file-blind `operator<` case.
+
+Golden review (`--verify --diff-summary`, positions over all changed files; "moved" =
+removed from one entry and added to another with the same name):
+
+| input      | entries changed | field | removed | added | moved | lost | new |
+|------------|----------------:|-------|--------:|------:|------:|-----:|----:|
+| small      |   790 / 4,669   | use   | 3,840 | 10,600 | 2,822 | 1,018 | 7,778 |
+|            |                 | definition | 24 | 55 | 19 | 5 | 36 |
+|            |                 | calls | 2,965 | 5,908 | 2,108 | 857 | 3,800 |
+| medium     | 49,251 / 217,200 | use  | 331,414 | 1,025,710 | 243,019 | 88,395 | 782,691 |
+|            |                 | definition | 20,903 | 72,344 | 16,854 | 4,049 | 55,490 |
+| medium-cpp | 41,183 / 243,246 | use  | 363,270 | 688,879 | 194,050 | 169,220 | 494,829 |
+
+The plan's rule for 2a1 was "removed ⊆ added per name" (pure moves). Three quarters of the
+removed `use` positions on small and medium are moves; the rest is "lost", and the
+investigation of that remainder is the reason 2a1 and 2a2 were done together:
+
+1. **With 2a1 alone the lost count barely changes when 2a2 is added** (small: 1,150 → 1,018
+   uses), so the loss is not the recursion target.
+2. A temporary diagnostic dumped the data of every profile that never reaches the output
+   (fragments erased without a root in `mergeFragments`, profiles without a declaration).
+   On small it accounts for 77 of the 354 name-level lost uses and all 5 lost definitions;
+   on medium 167 of 72,492. That part is pollution removed: resolution results that the old
+   code attached to an unrelated declared profile because the real owner was never printed.
+3. The rest is **hop-2 data from chains that span units**: caller `a` (unit 1) → parameter
+   `p` of `f` (unit 2) → parameter `q` of `g` (unit 3). The per-merge pass resolves `a`
+   right after unit 2 arrives and copies `p` before `q`'s data has reached `p`; `visited`
+   then freezes `a`. The old code still delivered `q`'s positions, into `.back()` of `a`'s
+   name, because `p`'s calls were appended to `.back()` and resolved when *that* profile's
+   turn came, later. Examples checked by hand: `funcSig` (srcsliceworker.cpp:1478) carried
+   the positions of `FunctionCallData`'s `funcPos` parameter; `testCaseInfo`, `m_regex`, `f`
+   and `p` carried a Catch benchmark helper's parameter use at catch.hpp:7048 that now sits
+   only in that helper's own locals. Nothing in today's output receives these positions
+   under the right name, because the owner was resolved too early. This is precisely the
+   "frozen `visited`" problem Step 2b removes by resolving once after all units are merged,
+   so these positions must come back there, in the right entries. The name-level lost sets
+   are saved (`benchmark/cache/review/2a-lost-<input>.json`, from
+   `benchmark/cache/save_lost.py`) and 2b's review checks them.
+
+The gains are the mirror image: uses and definitions now reach every caller that passes a
+variable on, not only the last profile of its name; on small 1,853 of 1,861 name-level new
+use positions land in an entry of the position's own file.
+
+Timing (baseline v0.2.1, 32 threads, output check `ok` for all four inputs; the baseline
+was re-measured after the check-order fix described below):
+
+| input      | v0.2.0 wall | v0.2.1 wall | Δ wall | v0.2.0 RSS | v0.2.1 RSS | output size v0.2.0 → v0.2.1 |
+|------------|------------:|------------:|-------:|-----------:|-----------:|-----------------------------:|
+| small      |     0.197 s |     0.194 s |   -2 % |      80 MB |      86 MB |            3.6 MB →   4.2 MB |
+| small-ca   |      25.1 s |      37.7 s |  +50 % |      87 MB |      97 MB |            4.7 MB →   5.8 MB |
+| medium     |      27.6 s |      22.8 s |  -17 % |   2,146 MB |   2,689 MB |          265.4 MB → 351.8 MB |
+| medium-cpp |      30.4 s |      19.8 s |  -35 % |   2,771 MB |   3,198 MB |          399.9 MB → 481.4 MB |
+
+Interleaved A/B against the Step 0 binary (same minute, medium, 32 threads): 27.7 / 25.6 s
+before vs 22.8 / 21.9 s after, RSS 3.0 → 2.7 GB.
+
+How the numbers came about:
+
+- The first measurement of this state had medium at 36 s and small-ca at 38 s. A perf
+  profile (medium, `-t 1`) showed `ResolveCall` at 18 % self time and
+  `GetSimpleFunctionName` at 7 %: `ParameterProfile` extracted the function name of every
+  same-named candidate before comparing positions, and names like `i` have thousands of
+  candidates. Testing the declaration position first (same conjunction, cheaper term first)
+  is output-neutral (goldens unchanged) and removed that cost. The remaining `ResolveCall`
+  self time is the per-call scan over all signatures of a name and the set insertions.
+- medium-cpp gains the most because `UpdateCalls` no longer pre-resolves `.back()` of every
+  parameter of every candidate overload, and its dead scans are gone.
+- **small-ca (`-c -a`) is 50 % slower and stays so until 2b.** With `-c` the per-merge
+  `ComputeControlPaths` pass walks every position of every profile after every unit, and 2a
+  distributes about 2.5× as many positions (uses 3,840 → 10,600 on this input, control edges
+  4,461 → 11,565), so the quadratic pass costs proportionally more. 2b replaces it with a
+  single pass at the end.
+- Outputs are a third larger: every caller that passes a variable on now carries the
+  callee's data, where before only the last same-named profile did. RSS follows the output
+  size (the JSON is built in memory before it is written).

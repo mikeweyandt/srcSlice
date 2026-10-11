@@ -120,7 +120,10 @@ public:
     void ComputeOuterPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines);
     void ComputeExitPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines);
 
-    SliceProfileIterator ArgumentProfile(const std::string& funcName, FunctionSignatureData& funcSig, int paramIndex);
+    // The profile of parameter `paramIndex` of the function `funcSig` describes (declared in the
+    // signature's file at the parameter's position), or nullptr when no unit produced it.
+    SliceProfile* ParameterProfile(const FunctionSignatureData& funcSig, unsigned int paramIndex,
+                                   const std::string& simpleFunctionName);
 
     // Need to track Aliases we have already read through
     // InterProcedural from the normal call should also be reflected
