@@ -557,7 +557,7 @@ resolve against names with many same-named profiles. The index costs about 25 MB
 ## Step 3d — buffered JSON entries and pointer-keyed element lookups (output-neutral) — done
 
 Baseline **v0.2.10**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 8`), suite 9/9
-plus the regression test.
+plus the regression test, ThreadSanitizer and AddressSanitizer suites clean.
 
 - Each JSON entry is assembled in one reused `std::string` (`SliceProfile::AppendJson`,
   `SlicePosition::AppendStart/AppendEnd`) and written with a single `write` call instead of
@@ -583,20 +583,326 @@ its larger gain); the parse phase did not move measurably (6.0 s), so the per-el
 hashing the cache replaces was cheaper than its share of samples suggested. Phase split on
 medium: parse 6.0 s, `Finalize` 1.9 s, output 1.1 s; 9.0 s in all.
 
-## Where things stand (v0.1.0 → v0.2.10)
+## Step 4 — sorted vectors for the profile sets (output-neutral) — done
 
-| input      | wall v0.1.0 | wall v0.2.10 | RSS v0.1.0 | RSS v0.2.10 | output v0.1.0 | output v0.2.10 |
+Baseline **v0.2.11**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 8`), suite 9/9
+plus the regression test, ThreadSanitizer and AddressSanitizer suites clean (plus a `-c -a` run
+under AddressSanitizer, since control edges and aliases exercise the sets too).
+
+`FlatSet<T>` (`src/headers/flatset.hpp`) replaces `std::set` for the six collections of a
+`SliceProfile` (`uses`, `definitions`, `cfunctions`, `dvars`, `aliases`, `controlEdges`), for
+the two locals of `Finalize` and the control-edge helpers' parameters. It is a sorted,
+duplicate-free `std::vector` with the operations the code uses (insert, range insert, erase,
+find, iteration, equality); it keeps `std::set`'s element order and its rule that the first
+inserted of two equivalent elements stays (the file-blind `SlicePosition::operator<` makes
+positions in different files with the same line and column equivalent, see findings), so the
+result is the same. What changes is the cost: a position no longer carries a 32-byte tree
+node plus the allocator's overhead, and merging one set into another (`ResolveCall`,
+`mergeFragments`, the alias pass) is one linear `set_union` instead of a tree insertion per
+element, with an append fast path when everything new sorts after what is there. A range
+insert checks whether its input is sorted and unique first and falls back to element-wise
+insertion otherwise, so it stays correct for any input. `Finalize` drops the vectors' slack
+before the output is written.
+
+| input      | v0.2.10 wall | v0.2.11 wall | Δ wall | v0.2.10 RSS | v0.2.11 RSS | Δ RSS |
+|------------|-------------:|-------------:|-------:|------------:|------------:|------:|
+| small      |      0.135 s |      0.126 s |   -7 % |       54 MB |       52 MB |  -4 % |
+| small-ca   |      0.223 s |      0.207 s |   -7 % |       53 MB |       52 MB |  -2 % |
+| medium     |       9.48 s |       7.43 s |  -22 % |    1,272 MB |      846 MB | -34 % |
+| medium-cpp |       13.2 s |       9.00 s |  -32 % |    1,782 MB |    1,173 MB | -34 % |
+
+Phase split on medium: parse 6.0 s, `Finalize` 0.77 s (was 1.9 s), output and the rest 0.5 s;
+7.2 s in all. The parse thread is now five sixths of the run.
+
+## Step 5 — M7, first part: the object model's `any` holds its pointer in place — done
+
+Baseline **v0.2.12**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 8`), suite 9/9
+plus the regression test, ThreadSanitizer and AddressSanitizer suites clean, plus `small -c -a`
+and `medium-cpp` (the C++ model) under AddressSanitizer.
+
+Every child link of the srcDispatch model is a `shared_ptr` to a data struct held in a
+`std::any` (`DeltaElement<std::any>`: the statements of a block, the parts of an expression,
+the names in a name, the types of a type). `std::any` keeps anything larger than one pointer
+on the heap, so each link cost a heap block of its own next to the control block the
+`shared_ptr` already has, plus the copies of those blocks whenever the link was copied.
+`srcDispatch::Any` (`srcDispatch/src/dispatcher/Any.hpp`) stores values of up to two pointers
+in place (a `shared_ptr` is exactly that) and keeps the heap for anything larger; it offers
+the operations the code used (construction and assignment from any value, copy, move,
+`type()`, `has_value()`, `reset()`, `any_cast` by value or by pointer, `bad_any_cast`). The
+change is a rename in 44 files (`std::any` → `srcDispatch::Any`, `std::any_cast` →
+`srcDispatch::any_cast`), nothing else.
+
+| input      | v0.2.11 wall | v0.2.12 wall | Δ wall | v0.2.11 RSS | v0.2.12 RSS |
+|------------|-------------:|-------------:|-------:|------------:|------------:|
+| small      |      0.126 s |      0.118 s |   -7 % |       52 MB |       51 MB |
+| small-ca   |      0.207 s |      0.200 s |   -3 % |       52 MB |       52 MB |
+| medium     |       7.43 s |       6.77 s |   -9 % |      846 MB |      845 MB |
+| medium-cpp |       9.00 s |       8.69 s |   -3 % |    1,173 MB |    1,173 MB |
+
+Phase split on medium: parse 5.4 s (was 6.0 s), `Finalize` 0.8 s, the rest 0.5 s; 6.7 s in
+all. The transient model never shows in the peak RSS, which is set after the parse.
+
+## Step 5b — per-name flags in the element slot (output-neutral) — done
+
+Baseline **v0.2.13**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 8`), suite 9/9
+plus the regression test, ThreadSanitizer and AddressSanitizer suites clean.
+
+`startElement`/`endElement` tested the tag text against eight literals per element
+(`argument_list`, `type`, `function`, `function_decl`, `block`, `if`, `namespace`, `name`,
+`super_list`) and copied it twice. The element slot of the pointer-keyed cache now carries
+those answers, decided once per distinct name, the tag text is copied once (into
+`ctx.currentTag`), and the attribute-name and first-attribute-value tests check the first
+character before calling `strcmp`. The C++ adapter's element stack finds the `type` attribute
+the same way.
+
+| input      | v0.2.12 wall | v0.2.13 wall | Δ wall | RSS      |
+|------------|-------------:|-------------:|-------:|----------|
+| small      |      0.118 s |      0.115 s |   -3 % | 52 MB    |
+| small-ca   |      0.200 s |      0.201 s |    0 % | 51 MB    |
+| medium     |       6.77 s |       6.65 s |   -2 % | 844 MB   |
+| medium-cpp |       8.69 s |       8.44 s |   -3 % | 1,173 MB |
+
+Phase split on medium: parse 5.3 s, `Finalize` 0.8 s, the rest 0.4 s; 6.5 s in all.
+
+## Step 5c — namespace cache in srcSAX, no teardown at exit (output-neutral) — done
+
+Baseline **v0.2.14**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 8`), suite 9/9
+plus the regression test, ThreadSanitizer and AddressSanitizer suites clean.
+
+- srcSAX's `start_element_ns` compared every element's prefix and URI against every namespace
+  of the root (two or three `strcmp` of a 30-character URI per element) to hand the policies
+  the root's copy of the string. libxml2 passes the same interned pointer for element after
+  element, so a one-entry cache per kind answers it: the previous element's result is reused
+  when the pointer and its text are unchanged (the text check keeps a reused pointer from
+  going wrong), otherwise the search runs and refills the cache.
+- `main` no longer destroys the `SrcSliceHandler` at exit: freeing the hundreds of thousands
+  of slices one by one took 2 % of a medium run, for memory the process returns anyway. Every
+  thread is joined before the constructor returns, so nothing depends on the destructor.
+
+| input      | v0.2.13 wall | v0.2.14 wall | Δ wall | RSS      |
+|------------|-------------:|-------------:|-------:|----------|
+| small      |      0.115 s |      0.113 s |   -2 % | 52 MB    |
+| small-ca   |      0.201 s |      0.200 s |    0 % | 52 MB    |
+| medium     |       6.65 s |       6.54 s |   -2 % | 845 MB   |
+| medium-cpp |       8.44 s |       8.30 s |   -2 % | 1,174 MB |
+
+The dispatcher and SAX plumbing is at diminishing returns now: the parse thread is 5.3 s of
+6.5 s on medium, about 2 s of it libxml2 and the rest the policies building the object
+model. `-t 1` and `-t 32` take the same time because one thread parses the whole archive.
+
+## Step 6 — S10: the archive is parsed by several parsers at once (output-neutral) — done
+
+Baseline **v0.2.15**. Goldens unchanged (`--verify` exact with `-t 1`, `-t 8` and `-t 32`),
+suite 9/9 plus the regression test; `testThreading` gained a case that runs the 64-unit
+archive with 2, 3, 4, 8, 16 and 32 parsers against the single-threaded result.
+ThreadSanitizer: suite clean, `small` with 4 parsers and `medium` with 16 parsers clean;
+AddressSanitizer: suite, `small -c -a` and `medium-cpp` with 8 parsers clean.
+
+The parse thread was the critical path of every run since Step 1: one thread read the whole
+archive, so `-t 1` and `-t 32` took the same time. A srcML archive is a root `<unit>` holding
+one `<unit>` per file, never nested deeper, and every `<` inside source text is escaped, so
+the byte range of each unit can be found with one pass over the bytes (`ScanArchive`,
+`src/cpp/srcslicearchive.cpp`: `memchr` for `<`, a quote-aware scan for the end of each
+start tag, self-closing units handled; anything unexpected falls back to one parser).
+Parser *j* of *N* then reads the prolog, units *j*, *j + N*, *j + 2N*, … and the root's end
+tag through libxml2's IO callback (`ChunkStream`), from its own handle on the file, so no
+part of the archive is held in memory, and hands its units over with their archive positions
+as sequence numbers. The manager merges by sequence number as before, from queues keyed on it,
+so the main structure is built exactly as a single parser builds it: the goldens are
+byte-identical at every parser count.
+
+The round-robin deal is what keeps the pipeline bounded: a parser may hand a unit over only
+when fewer than `maxInFlight` units are ahead of the merge frontier (`Notify`), so the unit
+the manager needs next always finds a slot, and every parser is woken when a merge moves the
+frontier (the first version forgot that wake-up and deadlocked on the second unit). Each
+unit's `#include` list now travels with the unit and reaches `fileDependencyTable` when the
+unit is merged, so the table is filled in archive order whichever parser read the file. The
+parsers' libxml2 contexts are created on one thread (srcSAX's one-time initialization is not
+thread-safe), the active parser and the sequence counters are thread-local, and a parser
+that fails aborts the run like a worker does. `--parsers N` sets the count (default: half
+the threads); `-t 1` is the old path.
+
+Parser sweep on medium (`-t 32`, two runs each; the backlog and in-flight knobs make no
+difference, the queues never fill):
+
+| parsers | wall   | max RSS  |
+|--------:|-------:|---------:|
+|       1 | 6.3 s  |   844 MB |
+|       4 | 2.87 s | 1,005 MB |
+|       8 | 2.42 s | 1,103 MB |
+|      16 | 2.22 s | 1,234 MB |
+|      32 | 2.12 s | 1,427 MB |
+
+Memory grows with the parser count, about 18 MB per parser on medium: each parser holds the
+unit model it is building, and some of PostgreSQL's generated files are enormous. The queues
+are not the cause. On the kernel subset the same cost is small next to the slices themselves.
+
+| input      | v0.2.14 wall | v0.2.15 wall | Δ wall | v0.2.14 RSS | v0.2.15 RSS | Δ RSS |
+|------------|-------------:|-------------:|-------:|------------:|------------:|------:|
+| small      |      0.113 s |      0.100 s |  -12 % |       52 MB |       62 MB | +20 % |
+| small-ca   |      0.200 s |      0.181 s |  -10 % |       52 MB |       62 MB | +20 % |
+| medium     |       6.54 s |       2.24 s |  -66 % |      845 MB |    1,273 MB | +51 % |
+| medium-cpp |       8.30 s |       3.94 s |  -53 % |    1,174 MB |    1,618 MB | +38 % |
+| large      |        64 s* |       29.6 s |  -54 % |     9.2 GB* |      9.8 GB |  +7 % |
+
+(* large at v0.2.11, the last measurement before this step; one repeat each.) A golden for
+`large` was recorded with `-t 1` (1,649,630 entries in 24,610 files) and the 32-thread run
+with 16 parsers matches it byte for byte. User time on
+medium went from 7.9 s to 9.7 s (sixteen dispatchers instead of one), wall from 6.5 s to
+2.2 s. For a memory-bound run, `--parsers 4` keeps most of the gain for a third of the cost.
+
+## Step 7 — `ResolveCall` merges the callees' positions level by level (output-neutral) — done
+
+Baseline **v0.2.16**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 32`), suite 9/9
+plus the regression test, ThreadSanitizer and AddressSanitizer suites clean.
+
+With the parse spread over sixteen parsers, `Finalize` is the largest serial phase (0.75 s of
+2.2 s on medium, 2.2 s of 3.8 s on medium-cpp), and inside it `ResolveCall` is 85 %: each
+caller merged every callee parameter's positions and calls into its own sets one callee at a
+time, each merge a pass over sets that grew with every callee. `ResolveCall` now records the
+callees' position, alias, dependence and edge ranges (pointers into the resolved parameters'
+sets, which nothing changes again) and merges them into the profile once per set with
+`FlatSet::InsertRanges`: adjacent pairs of ranges are united level by level, log(k) linear
+passes instead of k merges. Two rules keep the result identical to the callee-by-callee
+merge: the pending ranges are flushed before a callee is resolved for the first time
+(that resolution may read this profile in a recursive family and must find what the old
+code had merged by then), and a parameter passed to its own function is merged directly
+after a flush, because its ranges would point into the sets being replaced (the first
+version crashed on medium there). A sort-based batch was tried first and was slower: the
+inputs are already sorted ranges.
+
+What stays callee by callee: `definitions` (its inserts interleave with erases) and the call
+entries, whose ordering is not a strict weak ordering (an unresolved call's empty definition
+position compares equivalent to any other), so the order of their merges decides which
+entries survive; reordering them changed 22 entries on medium-cpp. That is the larger half
+of `ResolveCall`'s merge cost and waits for the ordering fix (findings, correctness).
+
+| input      | v0.2.15 wall | v0.2.16 wall | Δ wall | RSS      |
+|------------|-------------:|-------------:|-------:|----------|
+| small      |      0.100 s |      0.098 s |   -2 % | 62 MB    |
+| small-ca   |      0.181 s |      0.180 s |    0 % | 62 MB    |
+| medium     |       2.24 s |       2.24 s |    0 % | 1,252 MB |
+| medium-cpp |       3.94 s |       3.74 s |   -5 % | 1,593 MB |
+
+`Finalize` on medium-cpp: 2.17 s → 2.07 s (the position merges; the call-entry merges remain).
+
+## Step 8 — Finalize's per-name passes and the output on the worker threads (output-neutral) — done
+
+Baseline **v0.2.17**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 32`), suite 9/9
+plus the regression test; ThreadSanitizer (suite, `small` with 4 parsers, `medium` with 16)
+and AddressSanitizer (suite, `small -c -a`, `medium-cpp` with 8 parsers) clean.
+
+- `Finalize` ran everything on the main thread. Three of its passes touch one name's profile
+  vector at a time and read everything else: fragment gluing (`mergeFragments`, reads
+  `fileDependencyTable`), call completion (`UpdateCalls`, reads the signature table and the
+  declaration index) and the shrink pass. `ForEachProfileGroup` now spreads them over the
+  `-t` threads; `BuildDeclaredIndex` and `ResolveCall` stay on one thread (the latter is the
+  recursive, order-dependent part).
+- The JSON writer formatted and wrote entry by entry on the main thread. The entries are now
+  formatted in chunks of about 2 MB (estimated from the sets' sizes, so an entry with a
+  million positions is a chunk of its own) on up to eight threads, a wave of eight chunks at
+  a time, while the previous wave is written in order; a buffer an oversized entry inflated
+  is released after its wave. A first version with 256-entry chunks and a wave per thread
+  held hundreds of megabytes of the document at once (medium's `pstate` profiles alone carry
+  a million positions); this one holds at most two waves.
+
+| input      | v0.2.16 wall | v0.2.17 wall | Δ wall | v0.2.16 RSS | v0.2.17 RSS | Δ RSS |
+|------------|-------------:|-------------:|-------:|------------:|------------:|------:|
+| small      |      0.100 s |      0.100 s |    0 % |       62 MB |       66 MB |  +8 % |
+| small-ca   |      0.181 s |      0.182 s |   +1 % |       63 MB |       70 MB | +11 % |
+| medium     |       2.24 s |       1.90 s |  -16 % |    1,252 MB |    1,324 MB |  +6 % |
+| medium-cpp |       3.74 s |       3.28 s |  -13 % |    1,593 MB |    1,691 MB |  +6 % |
+
+Phase split on medium: parse 1.1 s, `Finalize` 0.62 s (was 0.75 s), the rest 0.2 s; on
+medium-cpp `Finalize` 1.83 s (was 2.07 s), of which `ResolveCall` is nearly all. The few
+megabytes on small are the thread stacks and buffers of a run that is over in a tenth of a
+second.
+
+## Measured, not applied — a file-aware ordering for the slice sets
+
+The sets order positions with `SlicePosition::operator<`, which compares the start line and
+column only (findings, correctness): positions of different files with the same line and
+column are equivalent and one is silently dropped, and a call entry whose definition
+position is unset is equivalent to any other, so the order in which entries are merged
+decides which survive. That is also what blocks the larger half of `ResolveCall`'s merge
+cost (Step 7). A strict weak ordering (file text, then start line and column; call entries
+likewise) was built and measured on top of v0.2.16, with `--verify --diff-summary`:
+
+| input      | entries changed | uses added | definitions added | call entries added |
+|------------|----------------:|-----------:|------------------:|-------------------:|
+| small      |               0 |          0 |                 0 |                  0 |
+| medium     |   3,679 / 217k  |     19,216 |               941 |              2,706 |
+| medium-cpp |  16,857 / 243k  |     97,098 |             1,449 |             81,311 |
+
+The added uses are the positions the file-blind order had dropped (a global's uses from
+several files). The added call entries are the ones a non-transitive equivalence had
+collapsed: on medium-cpp most are duplicates of resolved calls with an empty definition
+position or with an empty function name, which the writer then prints, so enabling the
+ordering also needs a decision about those entries. `testDeterminism` stopped finishing
+within five minutes with the ordering enabled (not investigated). The change is reverted;
+`FlatSet` keeps the comparator parameter it gained, and now uses its comparator in every
+operation (its equivalence tests and append fast path used the raw `<`, which is why the
+first measurement showed millions of duplicates). The test case for the defect keeps its
+`[!mayfail]` tag.
+
+## Tried and reverted — direct-indexed event handlers
+
+`EventListener::HandleEvent` finds the handler for an event in an `unordered_map<ParserState,
+std::function>` per listener, twice per element. Three replacements were measured on top of
+v0.2.11 (goldens unchanged for all three):
+
+| variant                                         | medium  | medium-cpp | small                      |
+|-------------------------------------------------|--------:|-----------:|----------------------------|
+| array with one slot per state                   |  -6 %   |    -1 %    | +10 % wall, 52 → 85 MB RSS |
+| flat vector of (state, heap-allocated handler)  |  -2 %   |    +1 %    | 52 → 50 MB                 |
+| deque of (state, handler)                       |  -2 %   |    -1 %    | +7 % wall, 52 → 56 MB      |
+
+The array's cost comes from the dispatcher keeping every lazily created policy object alive
+for the whole archive: a deeply nested C++ unit leaves thousands of them, each now carrying
+two 86-slot tables of `std::function` (5 KB). The two compact variants keep the memory but
+give up most of the speed: the handler objects must not move while one of them runs (a
+running handler registers further handlers), so they need an indirection or a block
+container. None is a clear win, so the map stays. Also measured and dropped: glibc malloc
+tunables (`mmap_threshold`, `trim_threshold`, `top_pad`) against the 1.3 s of system time on
+medium, which made no difference; the 220 k page faults are the resident set being touched
+once.
+
+## The kernel input, re-measured at v0.2.10
+
+`large` (the kernel without `drivers/`, 324 MB of C in 30,315 units) had only its v0.1.0
+measurement until now. One run at v0.2.10 (`--sizes large --repeat 1 --save-baseline --force`):
+
+| version | wall       | user   | max RSS   | output  | wall per MB of source |
+|---------|-----------:|-------:|----------:|--------:|----------------------:|
+| v0.1.0  | 1,623 s    | —      | 23.7 GB   | 1.9 GB  | 5.0 s                 |
+| v0.2.10 | 81 s       | 93 s   | 14.4 GB   | 10.2 GB | 0.25 s                |
+| v0.2.11 | 64 s       | 78 s   | 9.2 GB    | 10.2 GB | 0.20 s                |
+| v0.2.15 | 29.6 s     | —      | 9.8 GB    | 10.2 GB | 0.09 s                |
+
+The superlinear term is gone: PostgreSQL costs 0.18 s per MB and the kernel subset 0.25 s,
+against 11× at v0.1.0. The output is five times larger (the complete closure). Memory is the
+kernel's constraint: the sorted vectors of v0.2.11 took it from 14.4 GB to 9.2 GB (28 bytes
+per byte of source), most of what remains being the position and call-entry data of the
+slices themselves. `x-large` (the full kernel, 1.45 GB of source) was not re-run; by these
+numbers it would need about five minutes and roughly 40 GB, the container's limit.
+
+## Where things stand (v0.1.0 → v0.2.17)
+
+| input      | wall v0.1.0 | wall v0.2.17 | RSS v0.1.0 | RSS v0.2.17 | output v0.1.0 | output v0.2.17 |
 |------------|------------:|-------------:|-----------:|------------:|--------------:|---------------:|
-| small      |     0.202 s |      0.135 s |      78 MB |       54 MB |        3.6 MB |         4.4 MB |
-| small-ca   |      22.0 s |      0.223 s |      81 MB |       53 MB |        4.7 MB |         5.7 MB |
-| medium     |      24.3 s |       9.48 s |   3,021 MB |    1,272 MB |      265.4 MB |       941.6 MB |
-| medium-cpp |      31.2 s |       13.2 s |   3,973 MB |    1,782 MB |      399.9 MB |        1.69 GB |
+| small      |     0.202 s |      0.100 s |      78 MB |       66 MB |        3.6 MB |         4.4 MB |
+| small-ca   |      22.0 s |      0.182 s |      81 MB |       70 MB |        4.7 MB |         5.7 MB |
+| medium     |      24.3 s |       1.90 s |   3,021 MB |    1,324 MB |      265.4 MB |       941.6 MB |
+| medium-cpp |      31.2 s |       3.28 s |   3,973 MB |    1,691 MB |      399.9 MB |        1.69 GB |
+| large      |     1,623 s |       29.6 s*|  23.7 GB   |      9.8 GB*|        1.9 GB |        10.2 GB |
 
-(small-ca's v0.1.0 figure is its first measurement, taken with the Step 0 binary.) The slices
-now contain the complete transitive closure through the call graph, which is 3.5-4× more data
-than before, computed in about 40 % of the time and 40-45 % of the memory. On medium the parse
-thread remains the critical path (6.0 s of 9.0 s, libxml2 itself about 2 s of that), then
-`Finalize` (1.9 s) and the 942 MB of JSON (1.1 s); `-t 1` and `-t 32` still take the same
-time. Threaded runs are reproducible and identical to `-t 1`; a run with a failing unit
-reports the unit instead of aborting the process; `-c -a` costs a fraction of a second on
-small instead of 22 s.
+(* large at v0.2.15, one repeat; small-ca's v0.1.0 figure is its first measurement, taken
+with the Step 0 binary.) The slices now contain the complete transitive closure through the
+call graph, which is 3.5-5× more data than before, computed in 8-10 % of the time and about
+43 % of the memory on the medium inputs, and in 2 % of the time and 41 % of the memory on
+the kernel subset. The parse is spread over `threads / 2` parsers and the output over eight
+threads; what runs on one thread is `ResolveCall` (0.5 s of medium's 1.9 s, 1.7 s of
+medium-cpp's 3.3 s), whose call-entry merges wait for the set-ordering decision above.
+Threaded runs are reproducible and identical to `-t 1`; a run with a failing unit reports
+the unit instead of aborting the process; `-c -a` costs a fraction of a second on small
+instead of 22 s.

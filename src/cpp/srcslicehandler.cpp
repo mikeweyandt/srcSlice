@@ -13,6 +13,15 @@
 CallbackBuf cbOut(coutHandler);
 CallbackBuf cbErr(cerrHandler);
 
+namespace {
+    // Per parser thread: the parser running on it, so an abort can stop it, and the archive
+    // position of the next unit it hands over with the step between its units (the units
+    // of an archive are dealt round-robin to the parsers, perf plan S10).
+    thread_local srcSAXHandler* activeParser = nullptr;
+    thread_local std::size_t parserNextSeq = 0;
+    thread_local std::size_t parserSeqStride = 1;
+}
+
 // Number of CPU cores
 int CPUCount() {
 #ifdef _WIN64
@@ -32,10 +41,14 @@ int CPUCount() {
 #endif
 }
 
-void SrcSliceHandler::ApplyThreadSettings(int threads, int backlog, int inFlight) {
+void SrcSliceHandler::ApplyThreadSettings(int threads, int backlog, int inFlight, int parsers) {
     // if an invalid number is passed default to 1 thread
     threadCount = (threads > 0) ? threads : 1;
     const std::size_t workers = static_cast<std::size_t>(threadCount);
+    // parsers reading the archive at once: half the threads by default, never more than the
+    // threads (each needs a slot of the merge window, see Notify)
+    parserCount = (parsers > 0) ? parsers : std::max(1, threadCount / 2);
+    if (parserCount > threadCount) parserCount = threadCount;
 
     // parsed units waiting for a worker: one per worker by default, never fewer than one
     backlogCap = (backlog > 0) ? static_cast<std::size_t>(backlog) : workers;
@@ -51,12 +64,14 @@ SrcSliceHandler::SrcSliceHandler(const CliInfo& info) {
     calculateControlEdges = info.calculateControlEdges;
     expandCalls = info.expandCalls;
     expandAliases = info.expandAliases;
-    ApplyThreadSettings(info.threadCount, info.backlogCap, info.maxInFlight);
+    ApplyThreadSettings(info.threadCount, info.backlogCap, info.maxInFlight, info.parserCount);
 
     auto parse = [this, &info]() {
-        // argument must be a c string (const char*) or else a saxError is thrown
-        srcSAXController control(info.inputFile.c_str());
-        Parse(control);
+        ArchiveFile bytes(info.inputFile);
+        ParseArchive(bytes, [&info]() {
+            // argument must be a c string (const char*) or else a saxError is thrown
+            return std::make_unique<srcSAXController>(info.inputFile.c_str());
+        });
     };
 
     if (progressMode) {
@@ -87,11 +102,11 @@ SrcSliceHandler::SrcSliceHandler(std::string& sourceCodeStr, const TestArg& info
     expandAliases = info.expandAliases;
 
     // most test-suite inputs are single units; threading tests pass their own count
-    ApplyThreadSettings(info.threadCount, info.backlogCap, info.maxInFlight);
+    ApplyThreadSettings(info.threadCount, info.backlogCap, info.maxInFlight, info.parserCount);
 
     RunPipeline([this, &sourceCodeStr]() {
-        srcSAXController control(sourceCodeStr);
-        Parse(control);
+        ArchiveText bytes(sourceCodeStr);
+        ParseArchive(bytes, [&sourceCodeStr]() { return std::make_unique<srcSAXController>(sourceCodeStr); });
     });
 
     Finalize();
@@ -106,12 +121,88 @@ void SrcSliceHandler::Parse(srcSAXController& control) {
 
     // Notify stops this parser when the run is aborted; it is only valid during parse()
     struct Active {
-        SrcSliceHandler* self;
-        ~Active() { self->activeParser = nullptr; }
-    } active{this};
+        ~Active() { activeParser = nullptr; }
+    } active;
     activeParser = &handler;
 
     control.parse(&handler); // Start parsing
+}
+
+/*
+    One parser reads the input as it always did. Several parsers (perf plan S10) read it
+    through per-parser streams: the archive is scanned once for the byte ranges of its
+    top-level units, parser j gets the prolog, units j, j + N, j + 2N, ... and the root's end
+    tag, and hands them over with their archive positions as sequence numbers, so the manager
+    merges the same units in the same order as a single parser would. The round-robin deal
+    keeps every parser near the merge frontier, which the window in Notify enforces.
+*/
+void SrcSliceHandler::ParseArchive(const ArchiveBytes& bytes, const std::function<std::unique_ptr<srcSAXController>()>& wholeInput) {
+    int parsers = parserCount;
+    ArchiveLayout layout;
+    if (parsers > 1) {
+        layout = ScanArchive(bytes);
+        // a parser is worth it for a few units at least; otherwise read the input as is
+        const std::size_t units = layout.units.size();
+        if (!layout.isArchive || units < 4) {
+            parsers = 1;
+        } else if (static_cast<std::size_t>(parsers) > units / 2) {
+            parsers = static_cast<int>(units / 2);
+        }
+    }
+    stats.parsers = static_cast<std::size_t>(parsers);
+
+    if (parsers == 1) {
+        parserNextSeq = 0;
+        parserSeqStride = 1;
+        std::unique_ptr<srcSAXController> control = wholeInput();
+        Parse(*control);
+        return;
+    }
+
+    // the streams and controllers are created here, on one thread: srcSAX's one-time
+    // libxml2 initialization is not thread-safe
+    std::vector<std::unique_ptr<ChunkStream>> streams;
+    std::vector<std::unique_ptr<srcSAXController>> controls;
+    for (int j = 0; j < parsers; ++j) {
+        std::vector<ArchiveLayout::Range> mine;
+        for (std::size_t k = static_cast<std::size_t>(j); k < layout.units.size(); k += static_cast<std::size_t>(parsers)) {
+            mine.push_back(layout.units[k]);
+        }
+        streams.push_back(std::make_unique<ChunkStream>(bytes, layout, std::move(mine)));
+        controls.push_back(std::make_unique<srcSAXController>(streams.back().get(), &ChunkStream::Read, &ChunkStream::Close));
+    }
+
+    auto run = [this, parsers, &controls](int j) {
+        parserNextSeq = static_cast<std::size_t>(j);
+        parserSeqStride = static_cast<std::size_t>(parsers);
+        try {
+            Parse(*controls[static_cast<std::size_t>(j)]);
+        } catch (...) {
+            // stops the other parsers at their next unit and the manager; RunPipeline reports it
+            FailRun(ParseFailure(), "parsing (parser " + std::to_string(j + 1) + " of " + std::to_string(parsers) + ")");
+        }
+    };
+    std::vector<std::thread> threads;
+    for (int j = 1; j < parsers; ++j) threads.emplace_back(run, j);
+    run(0);
+    for (std::thread& thread : threads) thread.join();
+}
+
+// the exception being handled, as a std::exception (srcSAX throws its own types)
+std::exception_ptr SrcSliceHandler::ParseFailure() {
+    try {
+        throw;
+    } catch (const SAXError& e) {
+        return std::make_exception_ptr(std::runtime_error("srcSAX: " + e.message));
+    } catch (const std::exception&) {
+        return std::current_exception();
+    } catch (const std::string& message) {
+        return std::make_exception_ptr(std::runtime_error("srcSAX: " + message));
+    } catch (const char* message) {
+        return std::make_exception_ptr(std::runtime_error(std::string("srcSAX: ") + message));
+    } catch (...) {
+        return std::make_exception_ptr(std::runtime_error("parsing failed with an unknown exception"));
+    }
 }
 
 void SrcSliceHandler::RunPipeline(const std::function<void()>& parse) {
@@ -143,18 +234,9 @@ void SrcSliceHandler::RunPipeline(const std::function<void()>& parse) {
     std::exception_ptr parseError;
     try {
         parse();
-    } catch (const SAXError& e) {
-        // srcSAX's error type is not a std::exception; main() and the tests expect one
-        parseError = std::make_exception_ptr(std::runtime_error("srcSAX: " + e.message));
-    } catch (const std::exception&) {
-        parseError = std::current_exception();
-    } catch (const std::string& message) {
-        // srcSAXController's constructors throw a std::string when no context can be created
-        parseError = std::make_exception_ptr(std::runtime_error("srcSAX: " + message));
-    } catch (const char* message) {
-        parseError = std::make_exception_ptr(std::runtime_error(std::string("srcSAX: ") + message));
     } catch (...) {
-        parseError = std::make_exception_ptr(std::runtime_error("parsing failed with an unknown exception"));
+        // srcSAX's error types are not std::exceptions; main() and the tests expect one
+        parseError = ParseFailure();
     }
 
     finish.Run(parseError != nullptr);
@@ -187,13 +269,16 @@ void SrcSliceHandler::Notify(const srcDispatch::PolicyDispatcher *policy, const 
     std::shared_ptr<srcDispatch::UnitData> unit = policy->Data<srcDispatch::UnitData>();
     if (!unit) return;
 
-    // track what files are including to be used for fragment gluing
-    for (const auto& includeData : unit->includes) {
-        fileDependencyTable[ctx.currentFilePath].push_back(includeData->path.ToString());
-    }
-
     // build the worker outside the lock; the manager only needs the hand-over
     auto worker = std::make_unique<SrcSliceWorker>(std::move(unit), ctx, verboseMode, calculateControlEdges);
+
+    // what the file includes travels with the unit and reaches fileDependencyTable when the
+    // unit is merged, i.e. in archive order whichever parser handed it over
+    for (const auto& includeData : worker->unit->includes) {
+        worker->includes.push_back(includeData->path.ToString());
+    }
+    const std::size_t seq = parserNextSeq;
+    parserNextSeq += parserSeqStride;
     worker->onDone = [this]() {
         {
             std::lock_guard<std::mutex> lock(backlogMutex);
@@ -204,8 +289,13 @@ void SrcSliceHandler::Notify(const srcDispatch::PolicyDispatcher *policy, const 
 
     std::unique_lock<std::mutex> lock(backlogMutex);
 
-    // bounded backlog (M5): block the parser until the manager has taken a unit
-    spaceCv.wait(lock, [this]() { return backlog.size() < backlogCap || abortRun; });
+    // bounded backlog (M5): block the parser until the manager has taken a unit. With several
+    // parsers, also until this unit is within maxInFlight of the merge frontier: the parsers
+    // then stay close together, and fewer than maxInFlight units can ever be queued or in
+    // flight ahead of the unit the manager needs next, which therefore always finds a slot.
+    spaceCv.wait(lock, [&]() {
+        return abortRun || (backlog.size() < backlogCap && (stats.parsers <= 1 || seq < stats.merged + maxInFlight));
+    });
 
     if (abortRun) {
         // never throw through libxml2's C frames: stop the parser, RunPipeline reports firstError
@@ -214,9 +304,9 @@ void SrcSliceHandler::Notify(const srcDispatch::PolicyDispatcher *policy, const 
         return;
     }
 
-    worker->seq = nextSeq++;
+    worker->seq = seq;
     ++stats.units;
-    backlog.push_back(std::move(worker));
+    backlog.emplace(seq, std::move(worker));
     stats.maxBacklog = std::max(stats.maxBacklog, backlog.size());
 
     lock.unlock();
@@ -225,6 +315,11 @@ void SrcSliceHandler::Notify(const srcDispatch::PolicyDispatcher *policy, const 
 
 void SrcSliceHandler::MergeStructures(SrcSliceWorker& worker) {
     Blob& data = worker.data;
+
+    // track what files are including to be used for fragment gluing
+    for (std::string& include : worker.includes) {
+        fileDependencyTable[worker.sctx.currentFilePath].push_back(std::move(include));
+    }
 
     // manually move map entry values, merge will not merge if the keys between both maps exist
     for (auto& profileGroup : data.profileMap) {
@@ -298,18 +393,19 @@ void SrcSliceHandler::ManageThreads() {
 
     while (!abortRun) {
         try {
-            // 1. start workers while there is a unit, a free thread and room in the window
+            // 1. start workers while there is a unit, a free thread and room in the window;
+            //    the earliest unit first, so the one merged next is never left waiting
             while (!abortRun && !backlog.empty() && running < workers && inFlight.size() < maxInFlight) {
-                inFlight.push_back(std::move(backlog.front()));
-                backlog.pop_front();
-                SrcSliceWorker* worker = inFlight.back().get();
+                auto node = backlog.extract(backlog.begin());
+                SrcSliceWorker* worker = node.mapped().get();
+                inFlight.insert(std::move(node));
                 ++running;
                 stats.maxRunning = std::max(stats.maxRunning, running);
                 stats.maxInFlight = std::max(stats.maxInFlight, inFlight.size());
 
                 // only this thread removes from inFlight, so the pointer stays valid unlocked
                 lock.unlock();
-                spaceCv.notify_one(); // the parser may be waiting for backlog room
+                spaceCv.notify_all(); // a parser may be waiting for backlog room
                 try {
                     worker->Start();
                 } catch (...) {
@@ -323,10 +419,10 @@ void SrcSliceHandler::ManageThreads() {
                 lock.lock();
             }
 
-            // 2. merge the oldest started unit once it is done (seq order == parse order)
-            if (!abortRun && !inFlight.empty() && inFlight.front()->Finished()) {
-                std::unique_ptr<SrcSliceWorker> worker = std::move(inFlight.front());
-                inFlight.pop_front();
+            // 2. merge the unit that comes next in the archive once it is started and done
+            if (!abortRun && !inFlight.empty() && inFlight.begin()->first == stats.merged && inFlight.begin()->second->Finished()) {
+                std::unique_ptr<SrcSliceWorker> worker = std::move(inFlight.begin()->second);
+                inFlight.erase(inFlight.begin());
 
                 lock.unlock();
                 worker->WaitForJob(); // completion is already published; this reaps the thread
@@ -338,6 +434,9 @@ void SrcSliceHandler::ManageThreads() {
                 }
                 lock.lock();
                 ++stats.merged;
+                // the merge frontier moved: parsers waiting for their unit to come within the
+                // window (several parsers only) may continue
+                if (stats.parsers > 1) spaceCv.notify_all();
                 continue;
             }
 
@@ -348,7 +447,7 @@ void SrcSliceHandler::ManageThreads() {
             backlogCv.wait(lock, [&]() {
                 return abortRun
                     || (!backlog.empty() && running < workers && inFlight.size() < maxInFlight)
-                    || (!inFlight.empty() && inFlight.front()->Finished())
+                    || (!inFlight.empty() && inFlight.begin()->first == stats.merged && inFlight.begin()->second->Finished())
                     || (parseDone && backlog.empty() && inFlight.empty());
             });
         } catch (...) {
@@ -370,7 +469,7 @@ std::unordered_map<std::string, std::vector<SliceProfile>>& SrcSliceHandler::Get
 }
 
 // Find forward control-edges between conditional conditions. ie: if -> else if -> else
-void SrcSliceHandler::ComputeOuterPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines) {
+void SrcSliceHandler::ComputeOuterPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines) {
     /** @todo
      * Checking metadata within each SlicePosition, connect sline[i] to a sline[k] where k > i
      * corresponding if conditions to preceding elif conditions or the first sline within an else
@@ -411,7 +510,7 @@ void SrcSliceHandler::ComputeOuterPaths(std::set<std::pair<SlicePosition,SlicePo
 }
 
 // Collects the forward exiting control-flows of conditionals. ie: exiting conditional body
-void SrcSliceHandler::ComputeExitPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines) {
+void SrcSliceHandler::ComputeExitPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines) {
     /** @todo
      * Find the context if_stmt the sline[i] is within to find the first sline[k] not contained in the context if_stmt where k > i
      * sline[i] must be the sline that occurs LAST within the inner context of the if_stmt context (specific if, elif, else block)
@@ -523,7 +622,7 @@ void SrcSliceHandler::ComputeControlPaths() {
             if (!profile.containsDeclaration) continue;
 
             // Collect the slice lines and put them in numerical order
-            std::set<SlicePosition> sLinesOrdered;
+            PositionSet sLinesOrdered;
             sLinesOrdered.insert(profile.definitions.begin(), profile.definitions.end());
             sLinesOrdered.insert(profile.uses.begin(), profile.uses.end());
 
@@ -647,6 +746,34 @@ SliceProfile* SrcSliceHandler::ParameterProfile(const FunctionSignatureData& fun
     return nullptr;
 }
 
+void SrcSliceHandler::ForEachProfileGroup(const std::function<void(std::vector<SliceProfile>&)>& work) {
+    std::vector<std::vector<SliceProfile>*> groups;
+    groups.reserve(profileMap.size());
+    for (auto& [name, profiles] : profileMap) groups.push_back(&profiles);
+
+    const std::size_t threads = std::min<std::size_t>(static_cast<std::size_t>(std::max(threadCount, 1)), groups.size());
+    if (threads <= 1) {
+        for (std::vector<SliceProfile>* group : groups) work(*group);
+        return;
+    }
+
+    std::vector<std::exception_ptr> errors(threads);
+    std::vector<std::thread> pool;
+    auto run = [&](std::size_t t) {
+        try {
+            for (std::size_t i = t; i < groups.size(); i += threads) work(*groups[i]);
+        } catch (...) {
+            errors[t] = std::current_exception();
+        }
+    };
+    for (std::size_t t = 1; t < threads; ++t) pool.emplace_back(run, t);
+    run(0);
+    for (std::thread& thread : pool) thread.join();
+    for (const std::exception_ptr& error : errors) {
+        if (error) std::rethrow_exception(error);
+    }
+}
+
 void SrcSliceHandler::BuildDeclaredIndex() {
     declaredByPosition.clear();
     for (auto& [name, profiles] : profileMap) {
@@ -731,19 +858,21 @@ void SrcSliceHandler::Finalize() {
 
     if (calculateControlEdges) ComputeControlPaths();
 
-    for (auto& [name, profiles] : profileMap) {
-        mergeFragments(profiles);
-    }
+    // each name's fragments are glued into that name's roots: independent per name, so on
+    // all threads (fileDependencyTable is only read)
+    ForEachProfileGroup([this](std::vector<SliceProfile>& profiles) { mergeFragments(profiles); });
 
     // nothing moves a profile from here on: index them by declaration position for
     // ParameterProfile (UpdateCalls and ResolveCall call it per call entry)
     BuildDeclaredIndex();
 
-    for (auto& [name, profiles] : profileMap) {
+    // a profile's call completion writes only its own call entries and reads the signature
+    // table and the index: on all threads too
+    ForEachProfileGroup([this](std::vector<SliceProfile>& profiles) {
         for (auto& profile : profiles) {
             if (profile.containsDeclaration) UpdateCalls(profile);
         }
-    }
+    });
     ComputeInterprocedural();
     declaredByPosition.clear();
 
@@ -752,6 +881,18 @@ void SrcSliceHandler::Finalize() {
         // real alias chain and bounds a pathological cycle
         for (int pass = 0; pass < 32 && ComputeAliasInterprocedural(); ++pass) {}
     }
+
+    // the sets grew by insertion in the workers and by merges here: drop their slack
+    ForEachProfileGroup([](std::vector<SliceProfile>& profiles) {
+        for (auto& profile : profiles) {
+            profile.definitions.shrink_to_fit();
+            profile.uses.shrink_to_fit();
+            profile.cfunctions.shrink_to_fit();
+            profile.dvars.shrink_to_fit();
+            profile.aliases.shrink_to_fit();
+            profile.controlEdges.shrink_to_fit();
+        }
+    });
 
     if (verboseMode || progressMode) std::cout << "[*] Finished Second-Pass" << "\n";
 }
@@ -920,7 +1061,31 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
     if (!sp.cfunctions.empty()) {
         // calls made by the callee parameters this profile flows into; appended to sp after
         // the loop so the iteration over sp.cfunctions is not invalidated
-        std::set<FunctionCallData> complementaryCalls;
+        // What this profile receives from its callees' parameters is gathered here and
+        // merged into its sets once per set instead of once per callee (perf: those merges
+        // grew with the number of callees, and were three quarters of Finalize). The batches
+        // are flushed before a callee is resolved for the first time, because that
+        // resolution may read this profile (a recursive family) and must find what the
+        // callee-by-callee merge had left there. `definitions` stays callee by callee: its
+        // inserts interleave with erases; so do the call entries: their ordering is not a
+        // strict weak ordering (an unresolved call's empty definition position compares
+        // equivalent to any other), so the order of their merges decides which survive.
+        // (the ranges point into the callee parameters' sets, which a resolved parameter
+        // never changes again, and into their declaration positions)
+        std::vector<PositionSet::Range> useRanges;
+        std::vector<NamedPositionSet::Range> aliasRanges, dvarRanges;
+        std::vector<EdgeSet::Range> edgeRanges;
+        // calls made by the callee parameters this profile flows into; appended to sp after
+        // the loop so the iteration over sp.cfunctions is not invalidated
+        FlatSet<FunctionCallData> complementaryCalls;
+        auto rangeOf = [](const auto& set) { return std::make_pair(set.values().data(), set.values().data() + set.values().size()); };
+        auto flush = [&]() {
+            sp.uses.InsertRanges(useRanges);
+            sp.aliases.InsertRanges(aliasRanges);
+            sp.dvars.InsertRanges(dvarRanges);
+            sp.controlEdges.InsertRanges(edgeRanges);
+            useRanges.clear(); aliasRanges.clear(); dvarRanges.clear(); edgeRanges.clear();
+        };
 
         for (auto& cfunc : sp.cfunctions) {
             // if a cfunc ignore flag is enabled skip this index and continue
@@ -970,15 +1135,23 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
                     if (param) {
                         // resolve the parameter first so that data two or more hops away has
                         // reached it before it is copied; the visited guard stops cycles
+                        if (!param->visited) flush();
                         ResolveCall(*param);
 
                         // the resolved data belongs to the profile being resolved, not to
                         // the last profile that happens to share its name
                         SliceProfile& profile = sp;
 
+                        // a parameter passed to its own function: its sets are this profile's,
+                        // which the merges below replace, so nothing may point into them. The
+                        // pending ranges go first (their order), then this callee directly.
+                        const bool self = (param == &sp);
+                        if (self) flush();
+
                         if (!param->isReference && !param->isPointer) {
                             // pass by value
-                            profile.uses.insert(param->definitions.begin(), param->definitions.end());
+                            if (self) profile.uses.insert(param->definitions.begin(), param->definitions.end());
+                            else useRanges.push_back(rangeOf(param->definitions));
                         } else {
                             // pass by reference
                             profile.definitions.insert(param->definitions.begin(), param->definitions.end());
@@ -989,17 +1162,28 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
                             // Parameter initial declaration def line is considered a use towards the argument
                             profile.definitions.erase(param->declPosition);
                         }
-                        profile.uses.insert(param->declPosition);
-                        profile.uses.insert(param->uses.begin(), param->uses.end());
+                        if (self) {
+                            profile.uses.insert(param->declPosition);
+                            profile.uses.insert(param->uses.begin(), param->uses.end());
+                        } else {
+                            useRanges.emplace_back(&param->declPosition, &param->declPosition + 1);
+                            useRanges.push_back(rangeOf(param->uses));
+                        }
 
                         // ensure dependencies and aliases are within local-scope
                         if (profile.function == param->function) {
-                            profile.aliases.insert(param->aliases.begin(), param->aliases.end());
-                            profile.dvars.insert(param->dvars.begin(), param->dvars.end());
+                            if (self) {
+                                profile.aliases.insert(param->aliases.begin(), param->aliases.end());
+                                profile.dvars.insert(param->dvars.begin(), param->dvars.end());
+                            } else {
+                                aliasRanges.push_back(rangeOf(param->aliases));
+                                dvarRanges.push_back(rangeOf(param->dvars));
+                            }
                         }
 
                         // move the control edges over
-                        profile.controlEdges.insert(param->controlEdges.begin(), param->controlEdges.end());
+                        if (self) profile.controlEdges.insert(param->controlEdges.begin(), param->controlEdges.end());
+                        else edgeRanges.push_back(rangeOf(param->controlEdges));
 
                         // the parameter's own calls become calls of this profile (appended after the loop)
                         complementaryCalls.insert(param->cfunctions.begin(), param->cfunctions.end());
@@ -1014,6 +1198,7 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
                 }
             }
         }
+        flush();
         // move cfunc data over
         sp.cfunctions.insert(complementaryCalls.begin(), complementaryCalls.end());
     }

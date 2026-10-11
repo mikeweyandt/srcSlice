@@ -6,7 +6,7 @@ the line numbers below are those of the reviewed revision. Everything listed is 
 change can fix, ordered by expected payoff. Measured numbers come from the dev container (Ubuntu
 26.04, 32 cores, Release build) unless noted.
 
-## Status (October 2026, srcslice v0.2.10)
+## Status (October 2026, srcslice v0.2.17)
 
 `progress.md` records each step with its gate and numbers. Done, in order: S2 + M5 (condition-variable
 manager, bounded backlog, in-order merge: output no longer depends on the thread count), S1 (one
@@ -17,23 +17,32 @@ members that let the merge move instead of copy; then S3 (dispatcher and SAX per
 plumbing, v0.2.7), S4 (policy data handed over by move, v0.2.8, which also exposed and fixed
 the `ControlPolicy` reset bug listed under correctness), the `ParameterProfile` half of S6 (index
 by declaration position, v0.2.9), the JSON writer's per-position strings (same version), then
-buffered JSON entries and pointer-keyed element lookups in the dispatcher (v0.2.10).
+buffered JSON entries and pointer-keyed element lookups in the dispatcher (v0.2.10), and sorted
+vectors (`FlatSet`) for the profile's position, call, dependence, alias and edge sets (v0.2.11),
+the first part of M7, an `any` that holds the model's shared pointers in place (v0.2.12), and
+per-name flags for the dispatcher's tag tests (v0.2.13), a namespace cache in srcSAX and no
+teardown at exit (v0.2.14), S10, the archive parsed by several parsers at once (v0.2.15),
+`ResolveCall`'s callee positions merged level by level (v0.2.16), and Finalize's per-name
+passes and the output formatting on the worker threads (v0.2.17).
 
-| input | wall v0.1.0 → v0.2.10 | max RSS v0.1.0 → v0.2.10 | output |
+| input | wall v0.1.0 → v0.2.17 | max RSS v0.1.0 → v0.2.17 | output |
 |---|---|---|---|
-| medium (PostgreSQL) | 24.3 s → 9.5 s | 3.0 GB → 1.3 GB | 265 MB → 942 MB |
-| medium-cpp (OpenCV) | 31.2 s → 13.2 s | 4.0 GB → 1.8 GB | 400 MB → 1.7 GB |
-| small with `-c -a` | 22.0 s → 0.22 s | 81 MB → 53 MB | 4.7 MB → 5.7 MB |
+| medium (PostgreSQL) | 24.3 s → 1.9 s | 3.0 GB → 1.3 GB | 265 MB → 942 MB |
+| medium-cpp (OpenCV) | 31.2 s → 3.3 s | 4.0 GB → 1.7 GB | 400 MB → 1.7 GB |
+| large (kernel minus drivers) | 1,623 s → 30 s | 23.7 GB → 9.8 GB | 1.9 GB → 10.2 GB |
+| small with `-c -a` | 22.0 s → 0.20 s | 81 MB → 52 MB | 4.7 MB → 5.7 MB |
 
 The output grew because the slices now carry the full transitive closure through the call graph;
 before, resolution was frozen after each unit's merge and most cross-unit data never arrived (or
 arrived in the wrong entry, see "Correctness issues"). In recursive call families the closure a
 profile gets still depends on the traversal order of the depth-first `ResolveCall` (documented in
 `progress.md`, Step 2b; a fixpoint would make it exact). Still open: S5, the worker-side scans of S6
-(`findValidProfile`, `FetchSliceProfile`, off the critical path), S7, S9, M4, M7, and the kernel
-inputs have not been re-measured since v0.1.0. The parse thread is still the critical path on
-medium (6.0 s of 9.0 s, libxml2 about 2 s of that), then `Finalize` (1.9 s) and the JSON output
-(1.1 s).
+(`findValidProfile`, `FetchSliceProfile`, off the critical path), S7, S9, M4, M7; `x-large` has
+not been re-run. With the parse spread over sixteen parsers and the output over eight threads,
+medium's 1.9 s are about 1.1 s of parsing, 0.6 s of `Finalize` (`ResolveCall`, on one thread)
+and 0.2 s of output; the memory cost of a parser is the unit model it is building (about 18 MB
+each on medium). Measured and dropped: a direct-indexed
+handler table per listener and glibc malloc tunables (`progress.md`).
 
 ## What the baseline says
 
@@ -122,6 +131,19 @@ Three things stand out:
   `backlogMutex` before merging: take it only to pop/push the queue.
 - Expected effect: removes the superlinear term; the kernel should scale like PostgreSQL per MB.
   Also lets the parser run concurrently with merging.
+
+### S10. One thread parses the whole archive (added October 2026, done in v0.2.15)
+
+- Where: `SrcSliceHandler::Parse`, one `srcSAXController` over the whole file.
+- What happens: after S1-S9 the parse thread was five sixths of every run and `-t 1` took as
+  long as `-t 32`. libxml2 parses one document on one thread.
+- Fix: the units of an archive never nest and every `<` in source text is escaped, so one pass
+  over the bytes finds each top-level `<unit>`'s range; parser *j* of *N* reads the prolog,
+  units *j*, *j + N*, … and the root's end tag through the IO callback and hands them over with
+  their archive positions as sequence numbers; the manager merges by sequence number. The
+  round-robin deal keeps every parser within the merge window, so the pipeline stays bounded.
+- Effect: medium 6.5 s → 2.2 s, medium-cpp 8.3 s → 3.9 s, the kernel subset 64 s → 30 s, at
+  the price of one unit model per parser in memory (`--parsers` sets the count).
 
 ### S2. The manager thread spins
 
@@ -320,7 +342,11 @@ Not performance, but worth a ticket each:
   `operator==` also compares the file and the end position. `std::set<SlicePosition>` treats two
   positions in different files with the same line:column as equal, so the second one is silently
   dropped; after `mergeFragments` combines uses from many files into a global's profile this loses
-  uses.
+  uses. Measured in October 2026 (`progress.md`, "Measured, not applied"): a file-aware ordering
+  adds 19 k uses on medium and 97 k on medium-cpp, and 81 k call entries on medium-cpp that the
+  non-transitive call ordering had collapsed (many with an empty definition position or name).
+  Left for a product decision; it would also unblock batching the call-entry merges in
+  `ResolveCall`.
 - `GetSimpleFunctionName` uses `find_last_of("::")`/`find_last_of("->")` which match any single
   character of the set, and the `->` branch at `srcsliceworker.cpp:1161` splits on `"."`.
 - `ManageThreads` reads `backlog.empty()` for the exit test only under the lock, but `Notify` can
@@ -362,10 +388,12 @@ Not performance, but worth a ticket each:
 2. ~~S8/M6, M3, M1 + M2~~ (done, v0.2.3-v0.2.6).
 3. ~~S3 and S4 in srcDispatch/srcSAX~~ (done, v0.2.7-v0.2.8); ~~`ParameterProfile` index and the
    JSON writer's position strings~~ (done, v0.2.9); ~~buffered entries, pointer-keyed element
-   lookups~~ (done, v0.2.10). Next: sorted vectors instead of `std::set` for the position sets (the
-   set inserts of `ResolveCall` are the largest remaining item in `Finalize` and the node overhead
-   about a quarter of the resident memory), M4 (slim fragments), S7, S5 (thread pool), then the
-   `DeltaElement`/`std::any` model (M7), which is what is left of the parse floor.
+   lookups~~ (done, v0.2.10); ~~sorted vectors for the position sets~~ (done, v0.2.11); ~~the
+   model's `any` in place~~ (done, v0.2.12); ~~parallel parse~~ (S10, done, v0.2.15). Next:
+   ~~`Finalize`'s per-name passes and the output phase~~ (done, v0.2.16-v0.2.17). What is left
+   on one thread is `ResolveCall`; its call-entry merges wait for the set-ordering decision
+   (correctness issues). Then the rest of M7 (`DeltaElement`'s two optionals per link, the
+   per-token string appends), M4 (slim fragments), S7, S5 (thread pool).
 4. M7 if the above are not enough for the full kernel.
 
 Measure each step with `./benchmark/run.sh --sizes small,medium,medium-cpp`, confirm the tests

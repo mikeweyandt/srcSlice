@@ -122,9 +122,9 @@ goldens with the change:
 ./benchmark/run.sh --save-golden --force --note "fix cross-file position collisions"
 ```
 
-Goldens exist for the quick set. The kernel input `large` has none yet: it takes about 30
-minutes and 24 GB per run, so record it deliberately when a large check is wanted
-(`./benchmark/run.sh --save-golden --sizes large`, then `--verify --sizes large`).
+Goldens exist for the quick set and for `large` (recorded at v0.2.15 with `-t 1`, 1.65 M
+entries; a run takes about a minute and 10 GB now, so `--verify --sizes large` is a routine
+check: `--srcslice-args="-t 32"` verifies the parallel parse against it).
 `--save-golden --sizes all` skips inputs whose latest baseline recorded a failure (`x-large`
 cannot finish on 60 GB). A golden records the input commit, the srcslice commit
 and the arguments it was produced with; verifying against a golden recorded for a different

@@ -14,11 +14,13 @@
 #include <srcsliceprogress.hpp>
 #include <srcsliceparse.hpp>
 #include <srcsliceworker.hpp>
+#include <srcslicearchive.hpp>
 
 #include <algorithm>
 #include <condition_variable>
 #include <functional>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -75,6 +77,8 @@ struct CliInfo {
     // pipeline tuning (0 = default: backlogCap = threadCount, maxInFlight = 2 * threadCount)
     int backlogCap = 0;
     int maxInFlight = 0;
+    // parsers reading the archive at once (0 = default: half the threads, at least one)
+    int parserCount = 0;
 };
 struct TestArg {
     bool calculateControlEdges;
@@ -84,6 +88,7 @@ struct TestArg {
     int threadCount = 1;
     int backlogCap = 0;
     int maxInFlight = 0;
+    int parserCount = 0;
 };
 
 // Counters the manager keeps while a run is in progress (read after the constructor returns).
@@ -93,6 +98,7 @@ struct PipelineStats {
     std::size_t maxBacklog = 0;     // most parsed-but-not-started units at any time (<= backlogCap)
     std::size_t maxInFlight = 0;    // most started-but-not-merged units at any time (<= maxInFlight)
     std::size_t maxRunning = 0;     // most worker threads alive at any time (<= threadCount)
+    std::size_t parsers = 0;        // parsers that read the archive (1 unless it was split)
 };
 
 class SrcSliceHandler : public srcDispatch::PolicyListener {
@@ -117,8 +123,8 @@ public:
         we are not focusing on backwards-flows.
     */
     void ComputeControlPaths();
-    void ComputeOuterPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines);
-    void ComputeExitPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines);
+    void ComputeOuterPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines);
+    void ComputeExitPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines);
 
     // The profile of parameter `paramIndex` of the function `funcSig` describes (declared in the
     // signature's file at the parameter's position), or nullptr when no unit produced it.
@@ -146,9 +152,14 @@ private:
     // and rethrows the first failure (a worker exception or a parse error) as std::runtime_error.
     void RunPipeline(const std::function<void()>& parse);
     void Parse(srcSAXController& control);
+    // Parses the whole input: with one parser through the given controller factory, with
+    // several by splitting the archive into per-parser streams (perf plan S10).
+    void ParseArchive(const ArchiveBytes& bytes, const std::function<std::unique_ptr<srcSAXController>()>& wholeInput);
     void FailRun(std::exception_ptr error, const std::string& where);
+    // call from a catch block: the exception being handled as a std::exception
+    static std::exception_ptr ParseFailure();
     void MergeStructures(SrcSliceWorker& worker);
-    void ApplyThreadSettings(int threads, int backlog, int inFlight);
+    void ApplyThreadSettings(int threads, int backlog, int inFlight, int parsers);
 
     std::unordered_map<std::string, std::vector<SliceProfile>> profileMap;
     std::unordered_set <std::string> visited_func;
@@ -179,6 +190,10 @@ private:
     };
     std::unordered_map<DeclaredKey, std::vector<SliceProfile*>, DeclaredKeyHash> declaredByPosition;
     void BuildDeclaredIndex();
+    // Runs `work` on every name's profile vector, spread over the worker threads (the
+    // passes of Finalize that touch one name at a time: fragment gluing, call completion,
+    // the shrink pass). The first exception thrown is rethrown after every thread joined.
+    void ForEachProfileGroup(const std::function<void(std::vector<SliceProfile>&)>& work);
 
     std::vector<SlicePosition> loopdata;
     std::vector<SlicePosition> forloopdata;
@@ -203,17 +218,19 @@ private:
     std::mutex backlogMutex;
     std::condition_variable backlogCv;   // wakes the manager: unit queued, worker finished, parse done, abort
     std::condition_variable spaceCv;     // wakes the parser: backlog has room, or abort
-    std::deque<std::unique_ptr<SrcSliceWorker>> backlog;    // parsed, not started (FIFO)
-    std::deque<std::unique_ptr<SrcSliceWorker>> inFlight;   // started, not merged, in start (= parse) order
-    std::size_t nextSeq = 0;             // sequence number of the next unit the parser hands over
+    // parsed, not started, by archive position (one parser hands units over in order; several
+    // parsers interleave, and the manager always starts the earliest)
+    std::map<std::size_t, std::unique_ptr<SrcSliceWorker>> backlog;
+    // started, not merged, by archive position; the earliest is merged once it is done
+    std::map<std::size_t, std::unique_ptr<SrcSliceWorker>> inFlight;
     std::size_t running = 0;             // worker threads that have not published completion yet
     bool parseDone = false;              // the parser has returned; no more units will arrive
     bool abortRun = false;               // a worker or the parser failed: drop everything, stop the parser
     std::exception_ptr firstError;       // the failure that set abortRun
     PipelineStats stats;
-    srcSAXHandler* activeParser = nullptr;   // set by the parser thread for the duration of the parse
 
     int threadCount = 1;
+    int parserCount = 1;                 // >= 1; the archive is split when > 1 and it has enough units
     std::size_t backlogCap = 1;          // >= 1
     std::size_t maxInFlight = 2;         // >= threadCount
 

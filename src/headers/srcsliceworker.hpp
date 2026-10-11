@@ -126,7 +126,7 @@ namespace SrcSliceOperations {
     // for them, along with capturing expressions to update collected slices
     void CollectTryBlockData(Blob& data, const SliceCtx& sctx, const FunctionInfo& funcData, std::shared_ptr<srcDispatch::TryData>& tryBlock,
                                 const std::string& className);
-    void CollectConditionalData(Blob& data, const SliceCtx& sctx, const FunctionInfo& funcData, std::any& cntl, const std::string& className);
+    void CollectConditionalData(Blob& data, const SliceCtx& sctx, const FunctionInfo& funcData, srcDispatch::Any& cntl, const std::string& className);
     // Given a list of Function Parameters create Initial SliceProfiles for each Parameter
     void ProcessFunctionParameters(Blob& data, const SliceCtx& sctx, const FunctionInfo& funcData, std::vector<DeclInfo>& parameters,
                                     const std::string& currentFunctionName, const std::string& className);
@@ -190,6 +190,9 @@ public:
 
     // position of the unit in the archive; the manager merges in this order
     std::size_t seq = 0;
+    // the paths the unit includes, recorded into fileDependencyTable when it is merged (so
+    // the table is filled in archive order whichever parser handed the unit over)
+    std::vector<std::string> includes;
     // set when Perform failed; the manager turns it into a run failure naming the unit
     std::exception_ptr error;
     // invoked exactly once by the work thread after jobFinished is set, on every exit path

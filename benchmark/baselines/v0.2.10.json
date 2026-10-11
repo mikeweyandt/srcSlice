@@ -1,8 +1,8 @@
 {
   "meta": {
     "version": "0.2.10",
-    "note": "JSON entries assembled in a buffer and written once; dispatcher element handlers cached by libxml2 name pointer; cached non-diff URI; one compare in FunctionCallData ordering",
-    "timestamp": "2026-10-11T04:02:39Z",
+    "note": "large re-measured at v0.2.10 (one repeat)",
+    "timestamp": "2026-10-11T04:16:03Z",
     "hostname": "f44030a2e7be",
     "platform": "Linux-7.2.3-ogc3.1.fc44.x86_64-x86_64-with-glibc2.43",
     "machine": "x86_64",
@@ -14,11 +14,14 @@
       "path": "/workspaces/srcSlice/build-release/bin/srcslice",
       "build_type": "Release",
       "compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
-      "commit": "5483e9d11a5fd57613d8a5afd6e0a0ea31d9eba2",
+      "commit": "d001a1bd0ffcbffd235a89c1cc54725d24619cf2",
       "dirty": true
     },
     "srcslice_args": [],
-    "threads": 32
+    "threads": 32,
+    "merged_inputs": [
+      "large"
+    ]
   },
   "inputs": {
     "small": {
@@ -48,6 +51,13 @@
       "source_bytes": 43271851,
       "archive_bytes": 585599807,
       "srcml_seconds": 4.35
+    },
+    "large": {
+      "commit": "3857c2fe5449541e24afc5efdb0f81a8a8f9a3a0",
+      "files": 30315,
+      "source_bytes": 324158481,
+      "archive_bytes": 3678737982,
+      "srcml_seconds": 7.71
     }
   },
   "results": {
@@ -246,6 +256,25 @@
         "removed_files": 0,
         "digest_s": 20.29
       }
+    },
+    "large": {
+      "repeat": 1,
+      "wall_median_s": 81.0758,
+      "wall_min_s": 81.0758,
+      "user_s": 93.0822,
+      "sys_s": 12.5512,
+      "maxrss_mb": 14383.8,
+      "output_bytes": 10197940567,
+      "runs": [
+        {
+          "wall_s": 81.0758,
+          "user_s": 93.0822,
+          "sys_s": 12.5512,
+          "maxrss_mb": 14383.8,
+          "output_bytes": 10197940567
+        }
+      ],
+      "output_check": null
     }
   }
 }
