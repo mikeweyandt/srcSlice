@@ -9,18 +9,52 @@
 
 #include "srcslicecollection.hpp"
 
-SlicePosition::SlicePosition(): filename("") {}
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+
+const std::string* InternedString::Intern(const std::string& text) {
+    // worker threads live for one unit: the cache is small and dies with the thread
+    thread_local std::unordered_map<std::string, const std::string*> cache;
+    auto hit = cache.find(text);
+    if (hit != cache.end()) return hit->second;
+
+    // node-based: element addresses stay valid when the table rehashes
+    static std::mutex poolMutex;
+    static std::unordered_set<std::string> pool;
+    const std::string* shared;
+    {
+        std::lock_guard<std::mutex> lock(poolMutex);
+        shared = &*pool.insert(text).first;
+    }
+    cache.emplace(text, shared);
+    return shared;
+}
+
+const std::string* SlicePosition::InternFileName(const std::string& filename) {
+    return InternedString::Intern(filename);
+}
+
+SlicePosition::SlicePosition() {}
 SlicePosition::SlicePosition(
                     srcDispatch::DeltaElement<srcDispatch::Position> start,
                     srcDispatch::DeltaElement<srcDispatch::Position> end,
-                    std::string filename
-                ): start(start), end(end), filename(filename) {}
+                    const std::string& filename
+                ): file(InternFileName(filename)), hasStart(static_cast<bool>(start)), hasEnd(static_cast<bool>(end)) {
+    if (hasStart) {
+        startLine = static_cast<std::uint32_t>(start->GetLine());
+        startColumn = static_cast<std::uint32_t>(start->GetColumn());
+    }
+    if (hasEnd) {
+        endLine = static_cast<std::uint32_t>(end->GetLine());
+        endColumn = static_cast<std::uint32_t>(end->GetColumn());
+    }
+}
 
-SlicePosition::SlicePosition(const SlicePosition& position) {
-    start = position.start;
-    end = position.end;
-    filename = position.filename;
-    data = position.data;
+namespace {
+    std::string PositionText(std::size_t line, std::size_t column) {
+        return std::to_string(line) + ':' + std::to_string(column);
+    }
 }
 
 // Creates a String of a JSON object, ie: "file.cpp:2:12"
@@ -30,13 +64,13 @@ std::string SlicePosition::StartToString() const {
 
     s += "\"";
 
-    if (!filename.empty()) {
-        s += filename;
+    if (!GetFileName().empty()) {
+        s += GetFileName();
     }
 
-    if (start) {
+    if (hasStart) {
         s += ":";
-        s += start->ToString();
+        s += PositionText(startLine, startColumn);
     }
 
     s += "\"";
@@ -50,13 +84,13 @@ std::string SlicePosition::EndToString() const {
 
     s += "\"";
 
-    if (!filename.empty()) {
-        s += filename;
+    if (!GetFileName().empty()) {
+        s += GetFileName();
     }
 
-    if (end) {
+    if (hasEnd) {
         s += ":";
-        s += end->ToString();
+        s += PositionText(endLine, endColumn);
     }
 
     s += "\"";
@@ -68,14 +102,14 @@ std::string SlicePosition::RangeToString() const {
     std::string s;
 
     s += "\"";
-    if (start && !filename.empty()) {
-        s += filename; s += ":";
-        s += start->ToString();
+    if (hasStart && !GetFileName().empty()) {
+        s += GetFileName(); s += ":";
+        s += PositionText(startLine, startColumn);
     }
     s += "-";
-    if (end && !filename.empty()) {
-        s += filename; s += ":";
-        s += end->ToString();
+    if (hasEnd && !GetFileName().empty()) {
+        s += GetFileName(); s += ":";
+        s += PositionText(endLine, endColumn);
     }
     s += "\"";
 
@@ -87,40 +121,28 @@ std::string SlicePosition::RangeToString() const {
 std::string SlicePosition::ToNameString() const {
     std::string s;
 
-    std::string lineStr = start ? std::to_string(start->GetLine()) : "0";
-    std::string colStr = start ? std::to_string(start->GetColumn()) : "0";
+    std::string lineStr = hasStart ? std::to_string(startLine) : "0";
+    std::string colStr = hasStart ? std::to_string(startColumn) : "0";
     s += lineStr + "-" + colStr;
 
     return s;
 }
 
-srcDispatch::DeltaElement<srcDispatch::Position> SlicePosition::GetStart() const {
-    return start;
+const std::string& SlicePosition::GetFileName() const {
+    static const std::string none;
+    return file ? *file : none;
 }
-srcDispatch::DeltaElement<srcDispatch::Position> SlicePosition::GetEnd() const {
-    return end;
-}
-std::string SlicePosition::GetFileName() const { return filename; }
 // return specific data about a position
 PositionMeta& SlicePosition::GetData() { return data; }
 
-SlicePosition& SlicePosition::operator=(const SlicePosition& rhs) {
-    if (this == &rhs) return *this;
-
-    start = rhs.start;
-    end = rhs.end;
-    filename = rhs.filename;
-    data = rhs.data;
-
-    return *this;
-}
 bool SlicePosition::operator==(const SlicePosition& rhs) const {
-    bool validPositions = (start && end && rhs.start && rhs.end);
+    bool validPositions = (hasStart && hasEnd && rhs.hasStart && rhs.hasEnd);
     if (validPositions) {
-        bool matchingStarts = start->GetLine() == rhs.start->GetLine() && start->GetColumn() == rhs.start->GetColumn();
-        bool matchingEnds = end->GetLine() == rhs.end->GetLine() && end->GetColumn() == rhs.end->GetColumn();
-        bool matchingFiles = filename == rhs.filename;
-        
+        bool matchingStarts = startLine == rhs.startLine && startColumn == rhs.startColumn;
+        bool matchingEnds = endLine == rhs.endLine && endColumn == rhs.endColumn;
+        // interned: equal paths share one string; fall back to the text for safety
+        bool matchingFiles = file == rhs.file || GetFileName() == rhs.GetFileName();
+
         return matchingStarts && matchingEnds && matchingFiles;
     }
     return false;
@@ -129,13 +151,13 @@ bool SlicePosition::operator!=(const SlicePosition& rhs) const {
     return !(*this == rhs);
 }
 bool SlicePosition::operator<(const SlicePosition& rhs) const {
-    if (!start || !rhs.start) return false;
+    if (!hasStart || !rhs.hasStart) return false;
 
     // line comparison
-    if (start->GetLine() > rhs.start->GetLine()) return false;
-    if (start->GetLine() < rhs.start->GetLine()) return true;
+    if (startLine > rhs.startLine) return false;
+    if (startLine < rhs.startLine) return true;
 
-    return start->GetColumn() < rhs.start->GetColumn();
+    return startColumn < rhs.startColumn;
 }
 bool SlicePosition::operator<=(const SlicePosition& rhs) const {
     return (*this < rhs) || *this == rhs;
@@ -151,20 +173,20 @@ bool SlicePosition::operator>=(const SlicePosition& rhs) const {
 bool IsContained(SlicePosition& a, SlicePosition b) {
     if (a.GetFileName() != b.GetFileName()) return false;
     
-    bool lineContained = a.GetStart()->GetLine() >= b.GetStart()->GetLine() && a.GetEnd()->GetLine() <= b.GetEnd()->GetLine();
+    bool lineContained = a.StartLine() >= b.StartLine() && a.EndLine() <= b.EndLine();
 
-    bool isOneLiner = a.GetStart()->GetLine() == b.GetStart()->GetLine() && a.GetEnd()->GetLine() == b.GetEnd()->GetLine();
+    bool isOneLiner = a.StartLine() == b.StartLine() && a.EndLine() == b.EndLine();
     bool colContained = true;
     
     if (isOneLiner) {
         // start column of a should be greater than the start column of b
         // end column of a should be less than the end column of b
-        colContained = a.GetStart()->GetColumn() >= b.GetStart()->GetColumn() && a.GetEnd()->GetColumn() <= b.GetEnd()->GetColumn();
+        colContained = a.StartColumn() >= b.StartColumn() && a.EndColumn() <= b.EndColumn();
     } else {
         // if the end row of b and the start row of a are the same
         // check if the start column of a is less than the end column of b
-        if (a.GetStart()->GetLine() == b.GetEnd()->GetLine()) {
-            colContained = a.GetStart()->GetColumn() < b.GetEnd()->GetColumn();
+        if (a.StartLine() == b.EndLine()) {
+            colContained = a.StartColumn() < b.EndColumn();
         }
     }
 
@@ -173,12 +195,12 @@ bool IsContained(SlicePosition& a, SlicePosition b) {
 
 size_t GetDistance(SlicePosition& a, SlicePosition& b) {
     size_t dist = 0;
-    dist = b.GetStart()->GetLine() - a.GetStart()->GetLine();
+    dist = b.StartLine() - a.StartLine();
 
     // if row a > row b => a isnt connected to b
     if (dist >= 0) {
-        size_t bc = b.GetEnd()->GetColumn();
-        size_t ac = a.GetStart()->GetColumn();
+        size_t bc = b.EndColumn();
+        size_t ac = a.StartColumn();
         
         dist += ac - bc;
     }
@@ -206,7 +228,15 @@ FunctionSignatureData::FunctionSignatureData(
     position = SlicePosition(func->startPosition, func->endPosition, ctx.currentFilePath);
     name = func->name.ToString();
     returnType = func->returnType.ToString();
-    parameters = func->parameters;
+    parameters.reserve(func->parameters.size());
+    for (const auto& param : func->parameters) {
+        SignatureParameter slim;
+        if (param && param->name && param->name.GetElement()) {
+            slim.name = param->name.ToString();
+            slim.namePosition = SlicePosition(param->name->startPosition, param->name->endPosition, ctx.currentFilePath);
+        }
+        parameters.push_back(std::move(slim));
+    }
     containingClass = className;
     currentFilePath = ctx.currentFilePath;
     currentFileChecksum = ctx.currentFileChecksum;
@@ -225,28 +255,6 @@ FunctionCallData::FunctionCallData(
 ): functionName(funcName), parameterIndex(paramIndex),
 funcPos(funcPos), invokePosition(invokePos),
 argumentCount(argc), ignore(ignore_) {};
-
-FunctionCallData::FunctionCallData(const FunctionCallData& rhs) {
-    functionName = rhs.functionName;
-    invokePosition = rhs.invokePosition;
-    parameterIndex = rhs.parameterIndex;
-    argumentCount = rhs.argumentCount;
-    funcPos = rhs.funcPos;
-    ignore = rhs.ignore;
-};
-
-FunctionCallData& FunctionCallData::operator=(const FunctionCallData& rhs) {
-    if (this == &rhs) return *this;
-
-    functionName = rhs.functionName;
-    invokePosition = rhs.invokePosition;
-    parameterIndex = rhs.parameterIndex;
-    argumentCount = rhs.argumentCount;
-    funcPos = rhs.funcPos;
-    ignore = rhs.ignore;
-
-    return *this;
-}
 
 bool FunctionCallData::operator==(const FunctionCallData& rhs) const {
     if (functionName != rhs.functionName) return false;
@@ -293,12 +301,4 @@ SliceCtx::SliceCtx(const srcDispatch::srcSAXEventContext& ctx) {
     currentFileChecksum = ctx.currentFileChecksum;
     currentFileLanguage = ctx.currentFileLanguage;
     containingNamespaces = ctx.currentNamespaces;
-}
-
-SliceCtx::SliceCtx(const SliceCtx& rhs) {
-    defined = rhs.defined;
-    currentFilePath = rhs.currentFilePath;
-    currentFileChecksum = rhs.currentFileChecksum;
-    currentFileLanguage = rhs.currentFileLanguage;
-    containingNamespaces = rhs.containingNamespaces;
 }

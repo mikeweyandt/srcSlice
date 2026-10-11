@@ -75,10 +75,11 @@ tagged `[!mayfail]` describe intended behaviour that a known defect still breaks
 reports them without failing the suite, and the comment above each names the change expected
 to fix it. `progress.md` logs each performance step with its gate results and numbers.
 
-Sanitizer builds instrument srcSlice and the srcDispatch/srcSAX submodules:
+Sanitizer builds instrument srcSlice and the srcDispatch/srcSAX submodules. Each instrumented
+compile of the handler peaks at about 1.3 GB, so keep the job count small on a desktop:
 ```bash
 cmake -S . -B build-tsan -G Ninja -DSRCSLICE_SANITIZER=thread -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build-tsan && ctest --test-dir build-tsan -L srcslice --timeout 1800
+cmake --build build-tsan -j 8 && ctest --test-dir build-tsan -L srcslice --timeout 1800
 ```
 (`address` and `undefined` work the same way; with `address` set `ASAN_OPTIONS=detect_leaks=0`,
 libsrcml leaks.) `ctest -R regression` checks a real codebase against its recorded golden
@@ -137,7 +138,14 @@ Options:
   -a,--expand-aliases         Expand Alias list
   -v,--verbose                Display Debug Info when Slicing
   -p,--progress               Display Feedback Progress Bars
+
+Tuning:
+  --backlog INT               Parsed units that may wait for a worker before the parser pauses [Default: threads]
+  --in-flight INT             Started units that may wait to be merged in archive order [Default: 2 x threads]
 ```
+The output does not depend on the thread count: units are merged in archive order, so `-t 1`
+and `-t 32` produce the same bytes. The two tuning options bound how many parsed units and
+finished-but-unmerged units are held in memory at once.
 
 <br>
 

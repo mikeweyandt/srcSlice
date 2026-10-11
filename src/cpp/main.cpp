@@ -87,15 +87,19 @@ int main(int argc, char **argv)
 
         auto& sliceProfileMap = srcSliceHandler.GetProfileMap();
 
-        std::ostringstream sliceOutput;
-
         if (!outputFile.empty()) {
             // allow output file to be written in
             outFile = std::ofstream(outputFile);
+            std::cout << "Writing to :: " << outputFile << "\n";
         } else {
             // close output file
             outFile.close();
         }
+
+        // stream every slice straight to its destination: building the whole document in
+        // memory first doubled the peak RSS (perf plan M6). Same bytes as before: entries
+        // separated by ",\n", the document closed with "\n}".
+        std::ostream& sliceOutput = outputFile.empty() ? static_cast<std::ostream&>(std::cout) : outFile;
 
         // opening of the entire JSON object
         sliceOutput << "{\n";
@@ -110,34 +114,18 @@ int main(int argc, char **argv)
                 // we need to set the respective bool true
                 slice.expandCalls = expandCalls;
 
+                if (writtenSlices) sliceOutput << ",\n";
                 writtenSlices = true;
-                std::string name(slice.variableName + '-' + slice.declPosition.ToNameString() + '-' + slice.checksum);
 
                 sliceOutput << "\"" << slice.jsonKey() << "\":{\n";
                 sliceOutput << slice;
-                sliceOutput << "},\n";
+                sliceOutput << "}";
             }
         }
 
-        // remove trailing comma
-        std::string stream2string = sliceOutput.str();
-        sliceOutput.clear();
-
-        // remove trailing comma
-        if (writtenSlices) {
-            stream2string.resize(stream2string.length() - 2);
-        }
-
         // closing of the entire JSON object
-        stream2string += "\n}";
-
-        // write to either stdout or output file
-        if (!outputFile.empty()) {
-            std::cout << "Writing to :: " << outputFile << "\n";
-            outFile << stream2string;
-        } else {
-            std::cout << stream2string;
-        }
+        sliceOutput << "\n}";
+        sliceOutput.flush();
     } catch (const std::exception& e) {
         std::cout << "\033[31m" << e.what() << "\033[0m" << "\n";
         return 3;

@@ -11,6 +11,11 @@
 	"capAdd": ["SYS_PTRACE"],
 	"securityOpt": ["seccomp=unconfined"],
 
+	// Cap the container at 40 GB with no swap so a runaway build or run is OOM-killed inside the
+	// container instead of freezing the host (a full-parallel sanitizer build did that once).
+	// x-large benchmarks need over 20 GB, so leave room for them.
+	"runArgs": ["--memory=40g", "--memory-swap=40g"],
+
 	"customizations": {
 		"vscode": {
 			"extensions": [

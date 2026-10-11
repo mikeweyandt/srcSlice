@@ -69,7 +69,7 @@ change can be checked for changed results, not just changed timing:
 ```bash
 ./benchmark/run.sh --verify                          # quick set: slice once each, compare with the goldens (~2 min)
 ./benchmark/run.sh --verify --sizes small            # just srcSlice itself (a second)
-./benchmark/run.sh --verify --srcslice-args="-t 8"   # the same with 8 threads (must match once merging is deterministic)
+./benchmark/run.sh --verify --srcslice-args="-t 8"   # the same with 8 threads (must match: units are merged in archive order)
 ctest --test-dir build -R regression                 # same check for `small`, wired into ctest
 ```
 

@@ -596,10 +596,10 @@ SliceProfile* SrcSliceHandler::ParameterProfile(const FunctionSignatureData& fun
                                                  const std::string& simpleFunctionName) {
     if (paramIndex >= funcSig.parameters.size()) return nullptr;
 
-    const auto& paramDecl = funcSig.parameters[paramIndex];
-    if (!paramDecl || !paramDecl->name || !paramDecl->name.GetElement()) return nullptr;
+    const SignatureParameter& param = funcSig.parameters[paramIndex];
+    if (param.name.empty()) return nullptr;
 
-    const std::string paramName = paramDecl->name.ToString();
+    const std::string& paramName = param.name;
     auto spi = profileMap.find(paramName);
     if (spi == profileMap.end()) {
         if (verboseMode) {
@@ -610,7 +610,7 @@ SliceProfile* SrcSliceHandler::ParameterProfile(const FunctionSignatureData& fun
     }
 
     // the parameter is declared in the signature's file at the parameter name's position
-    SlicePosition paramDeclPos(paramDecl->name->startPosition, paramDecl->name->endPosition, funcSig.currentFilePath);
+    const SlicePosition& paramDeclPos = param.namePosition;
 
     // cheap position test first: names like `i` have thousands of profiles and the function
     // name extraction is a string scan (7 % of the run on medium when done for every candidate)
@@ -681,7 +681,19 @@ bool SrcSliceHandler::ComputeAliasInterprocedural() {
          one more hop per unit).
 */
 void SrcSliceHandler::Finalize() {
-    if (verboseMode || progressMode) std::cout << "[*] Performing Second-Pass" << "\n";
+    if (verboseMode || progressMode) {
+        std::size_t profiles = 0, fragments = 0, positions = 0, calls = 0;
+        for (auto& [name, group] : profileMap) {
+            for (auto& p : group) {
+                ++profiles;
+                fragments += p.isFragment;
+                positions += p.uses.size() + p.definitions.size();
+                calls += p.cfunctions.size();
+            }
+        }
+        std::cout << "[*] Performing Second-Pass on " << profiles << " profiles (" << fragments << " fragments), "
+                  << positions << " positions, " << calls << " call entries" << "\n";
+    }
 
     if (calculateControlEdges) ComputeControlPaths();
 
