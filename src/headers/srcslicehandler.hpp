@@ -125,17 +125,16 @@ public:
     SliceProfile* ParameterProfile(const FunctionSignatureData& funcSig, unsigned int paramIndex,
                                    const std::string& simpleFunctionName);
 
-    // Need to track Aliases we have already read through
-    // InterProcedural from the normal call should also be reflected
-    // if a profile with alias(s) is used in function calls
-    void ComputeAliasInterprocedural();
+    // Expand each declared profile's alias list by the aliases of its pointer/reference
+    // targets; returns true when any list grew (Finalize repeats it to a fixpoint)
+    bool ComputeAliasInterprocedural();
+    // Resolve the calls of every declared profile once (ResolveCall, recursive over callees)
     void ComputeInterprocedural();
-    // Perform a second pass over the system dictionary performing another round of ComputeInterprocedural
-    // against slices who have cfunction elements that could not resolve on the initial pass
+    // The single pass over the merged structure: control edges, fragment gluing, call
+    // completion and resolution, alias expansion (in that order)
     void Finalize();
 
     void mergeFragments(std::vector<SliceProfile>& profiles);
-    void ModifySlice(SliceProfile& sp);
     void ResolveCall(SliceProfile& sp);
     void UpdateCalls(SliceProfile& sp);
 

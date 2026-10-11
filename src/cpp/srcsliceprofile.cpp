@@ -49,7 +49,6 @@ SliceProfile::SliceProfile(const SliceProfile& rhs) {
     cfunctions = rhs.cfunctions;
     endOfScope = rhs.endOfScope;
     visited = rhs.visited;
-    updated = rhs.updated;
     showControlEdges = rhs.showControlEdges;
     currentPointerReference = rhs.currentPointerReference;
     isPotentialArray = rhs.isPotentialArray;
@@ -85,7 +84,6 @@ bool SliceProfile::operator==(const SliceProfile& rhs) const {
     if (cfunctions != rhs.cfunctions) return false;
     if (endOfScope != rhs.endOfScope) return false;
     if (visited != rhs.visited) return false;
-    if (updated != rhs.updated) return false;
     if (showControlEdges != rhs.showControlEdges) return false;
     if (currentPointerReference != rhs.currentPointerReference) return false;
     if (isPotentialArray != rhs.isPotentialArray) return false;

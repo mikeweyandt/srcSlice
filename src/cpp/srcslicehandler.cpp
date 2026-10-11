@@ -281,21 +281,8 @@ void SrcSliceHandler::MergeStructures(SrcSliceWorker& worker) {
         std::make_move_iterator(data.elseifdata.end())
     );
 
-    /*
-        after merging a sub-structure:
-            - perform interprocedural against the shared structure
-
-            - gather partial slices that later are dealt with via
-              the second pass (finalize)
-    */
-
-    // Handles Collecting Control-Edges
-    if (calculateControlEdges) ComputeControlPaths();
-
-    // populates Aliases attribute in slice profiles and
-    // performs crude interprocedural to connect use/def data
-    if (expandAliases) ComputeAliasInterprocedural();
-    ComputeInterprocedural();
+    // nothing else: control edges, fragment gluing, call resolution and alias expansion run
+    // once over the complete structure in Finalize (perf plan Step 2b)
 }
 
 /*
@@ -639,8 +626,8 @@ SliceProfile* SrcSliceHandler::ParameterProfile(const FunctionSignatureData& fun
 
 // Similiar to ComputeInterprocedural but focuses on building
 // a more detailed alias listing for slices of pointers
-void SrcSliceHandler::ComputeAliasInterprocedural() {
-    // speed problems origin
+bool SrcSliceHandler::ComputeAliasInterprocedural() {
+    bool changed = false;
     std::unordered_set <std::string> visited_alias;
 
     for (auto& sliceGroup : profileMap) {
@@ -670,22 +657,49 @@ void SrcSliceHandler::ComputeAliasInterprocedural() {
                     visited_alias.insert(aspi.jsonKey());
 
                     // push_back alias slice profile's aliases into the source slice aliases
+                    const std::size_t before = sp.aliases.size();
                     sp.aliases.insert(aspi.aliases.begin(), aspi.aliases.end());
+                    if (sp.aliases.size() != before) changed = true;
                     break;
                 }
             }
         }
     }
+    return changed;
 }
 
+/*
+    One pass over the complete structure, in an order where every step sees finished input:
+      1. control edges over each declared profile's own positions (before anything is
+         propagated into it, so a caller ends up with its own edges plus its callees');
+      2. fragments (uses of a variable in units that do not declare it) are glued into their
+         root, which then owns their calls; fragments without a root are dropped;
+      3. every declared profile gets its unresolved calls completed from the full signature
+         table (UpdateCalls), then all of them are resolved (ResolveCall pre-resolves the
+         callee parameters recursively, so the map order does not matter);
+      4. alias expansion is repeated until nothing changes (the per-merge passes used to give
+         one more hop per unit).
+*/
 void SrcSliceHandler::Finalize() {
     if (verboseMode || progressMode) std::cout << "[*] Performing Second-Pass" << "\n";
 
+    if (calculateControlEdges) ComputeControlPaths();
+
     for (auto& [name, profiles] : profileMap) {
         mergeFragments(profiles);
+    }
+
+    for (auto& [name, profiles] : profileMap) {
         for (auto& profile : profiles) {
-            if (profile.partial) ModifySlice(profile);
+            if (profile.containsDeclaration) UpdateCalls(profile);
         }
+    }
+    ComputeInterprocedural();
+
+    if (expandAliases) {
+        // each pass can add targets that the next pass follows; 32 hops is far beyond any
+        // real alias chain and bounds a pathological cycle
+        for (int pass = 0; pass < 32 && ComputeAliasInterprocedural(); ++pass) {}
     }
 
     if (verboseMode || progressMode) std::cout << "[*] Finished Second-Pass" << "\n";
@@ -744,29 +758,11 @@ void SrcSliceHandler::mergeFragments(std::vector<SliceProfile>& profiles) {
     }
 }
 
-// modular reusable component
-void SrcSliceHandler::ModifySlice(SliceProfile& sp) {
-    // do not revisit profiles
-    if (sp.updated) return;
-
-    // make sp as unvisited before passing it into ResolveCall
-    sp.visited = false;
-
-    // mark the slice as updated so we do not push
-    // duplicate addresses into the partialSlices container
-    sp.updated = true;
-
-    // attempt to update the cfunctions entries with the full function-signature dictionary
-    UpdateCalls(sp);
-
-    // attempt ComputeInterprocedural against the slice profile (sp)
-    // sp gets marked as visited once again
-    ResolveCall(sp);
-}
-
+// Complete the cfunctions entries whose definition position is unknown (the call's unit did
+// not contain the function) from the full signature table; overloaded names get one entry per
+// signature whose parameter profile exists.
 void SrcSliceHandler::UpdateCalls(SliceProfile& sp) {
-    // do not read/modify the slice if its not a partial
-    if (!sp.partial) return;
+    if (sp.cfunctions.empty()) return;
 
     // collection of call data that is to be later added to the given slice profile
     std::vector<FunctionCallData> toInsert, toErase;
@@ -850,15 +846,14 @@ void SrcSliceHandler::UpdateCalls(SliceProfile& sp) {
     for (auto& data : toInsert) {
         sp.cfunctions.insert(data);
     }
-
-    // toggle off just incase so we do not run over this profile again
-    sp.partial = false;
 }
 
+// Resolve every declared profile once; fragments were glued into their roots (or dropped)
+// before this runs, so they are not resolved on their own any more.
 void SrcSliceHandler::ComputeInterprocedural() {
     for (auto& [name, profiles] : profileMap) {
         for (auto& sp : profiles) {
-            ResolveCall(sp);
+            if (sp.containsDeclaration) ResolveCall(sp);
         }
     }
 }
@@ -869,11 +864,6 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
     // ignore profiles with no value
     if ((sp.variableName == "*LITERAL*")) return;
     
-    auto addPartialSlice = [this](SliceProfile &sp) {
-        if (sp.updated) return;
-        sp.partial = true;
-    };
-
     // label the profile as visited to avoid circular profile linkage
     sp.visited = true;
 
@@ -902,7 +892,6 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
                 }
 
                 if (sigIndex >= funcSigCollection->second.size()) {
-                    addPartialSlice(sp);
                     continue; // no signature could be found
                 }
 
@@ -973,7 +962,6 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
                 if (verboseMode) {
                     std::cout << "[-] " << __FUNCTION__ << ":" << __LINE__ << " | Cannot find Function Signature Collection for '" << cfunc.functionName << "'" << "\n";
                 }
-                addPartialSlice(sp);
             }
         }
         // move cfunc data over

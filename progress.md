@@ -241,3 +241,95 @@ How the numbers came about:
 - Outputs are a third larger: every caller that passes a variable on now carries the
   callee's data, where before only the last same-named profile did. RSS follows the output
   size (the JSON is built in memory before it is written).
+
+## Step 2b — resolve once in Finalize (S1; output change, reviewed) — done
+
+Baseline **v0.2.2**. Goldens re-recorded (`--save-golden --force --note "2b: ..."`).
+
+What changed (`src/cpp/srcslicehandler.cpp`, `srcslicehandler.hpp`, `srcsliceprofile.hpp/.cpp`,
+`srcsliceworker.cpp`):
+
+- `MergeStructures` only appends. The per-unit whole-map passes (`ComputeControlPaths`,
+  `ComputeAliasInterprocedural`, `ComputeInterprocedural`) are gone from the merge.
+- `Finalize` is one ordered pass: (1) control edges over every declared profile's own
+  positions; (2) `mergeFragments` for every name; (3) `UpdateCalls` for every declared
+  profile (completing calls whose function was not in the call's unit from the full
+  signature table), then `ResolveCall` for every declared profile (recursion pre-resolves the
+  callee parameters, so the map order does not matter); (4) alias expansion repeated until
+  no list grows (cap 32).
+- `partial`, `updated`, `ModifySlice` and `addPartialSlice` are deleted; fragments are no
+  longer resolved on their own (their calls are resolved by the root they are glued into).
+
+Tests: four more `testInterprocedural` cases lost `[!mayfail]` (callee later passes the
+parameter on; argument named like the parameter; header global passed on; mutual recursion
+across units). The mutual-recursion expectation gained the third call that the slice really
+contains (m → ping's x → pong's y → ping again). Only the file-blind `operator<` case is still
+`[!mayfail]`. All 15 `testCtrlEdges` cases (edges compared) still pass.
+
+Golden review (`--verify --diff-summary` against the 2a goldens):
+
+| input      | entries changed | use removed / added | calls removed / added | definition removed / added |
+|------------|----------------:|--------------------:|----------------------:|---------------------------:|
+| small      |    160 / 4,669  |         108 / 1,326 |           607 / 1,345 |                      0 / 3 |
+| small-ca   |    837 / 4,669  |         108 / 1,326 |           607 / 1,345 |  0 / 3 (controlEdges 4,784 / 808) |
+| medium     | 62,233 / 217,200 |   23,967 / 4,189,631 |   267,080 / 2,857,687 |          1,243 / 220,206 |
+| medium-cpp | 42,596 / 243,246 |      565 / 3,911,557 |   123,266 / 4,754,879 |              77 / 38,534 |
+
+**Gains.** The closure now reaches every caller. Before, a profile was resolved in the pass
+right after its unit was merged and then frozen (`visited`), so anything that arrived later
+in its call chain never reached it; `use` positions on medium go from 1.85 M to 6.0 M in
+total, concentrated in hub variables (`root`, `parsetree`, `conn`, `estate`: the top entry
+has 5,547 uses, 901 entries have more than 1,000; the median entry goes from 2 to 3). The
+output files grow accordingly: medium 352 → 942 MB, medium-cpp 481 MB → 1.7 GB.
+Of the positions 2a had lost, 26 % are back on medium under the same name (18,695 of 72,492
+uses); the rest were owned by profiles that never reach the output.
+
+**Control edges (small-ca).** 4,784 edges removed, 808 added: the per-merge pass used to
+recompute a profile's edges after positions from other functions had been propagated into
+it, producing pairs between a profile's own positions and foreign ones sorted by line. Now a
+profile's edges are its own plus its callees' (the semantics `testCtrlEdges` pins).
+
+**Losses, and what they are.** The plan's rule was "no entry loses a `use`". small loses 108
+uses, all in one entry; medium loses 23,967 in 508 entries (60,878 gain). Every lost position
+is still present in another entry of the output. The affected entries are parameters of
+mutually recursive function families: Catch's `stringify` ↔ `StringMaker<T>::convert`
+(`pair`, 156 → 48 uses), PostgreSQL's `transformJson*` (`ve`, `behavior`, `sublink`, `agg`),
+`exec_stmt_*` (`estate`), `executeItem*` (`cxt`), the planner (`best_path`). `ResolveCall` is
+a depth-first walk with a `visited` guard: the first profile to enter a cycle copies its
+cycle-mates while they are still being resolved and ends up with a truncated closure; later
+entrants get more. Which profile enters first depends on the traversal order, and the old
+per-merge schedule simply entered these cycles in a different order. Neither result is the
+complete slice. The complete answer needs a fixpoint (repeat the pass until nothing changes,
+or resolve strongly connected components as a unit); that is outside the approved plan and is
+raised as a decision in the recap. 2c (canonical order) makes the current result independent
+of the archive's file order but does not change this.
+
+The diff is accepted as the intended semantics of S1 (one resolution over the complete
+structure) with the cycle behaviour documented, not as a loss-free step.
+
+Timing (baseline v0.2.2, 32 threads, output check `ok` for all four inputs at 32 threads and
+with `-t 8`; `ctest -R regression` green):
+
+| input      | v0.2.1 wall | v0.2.2 wall | v0.2.1 RSS | v0.2.2 RSS | output v0.2.1 → v0.2.2 |
+|------------|------------:|------------:|-----------:|-----------:|-----------------------:|
+| small      |     0.194 s |     0.189 s |      86 MB |      78 MB |      4.2 MB →   4.4 MB |
+| small-ca   |      37.7 s |     1.18 s  |      97 MB |      81 MB |      5.8 MB →   5.7 MB |
+| medium     |      22.8 s |      25.3 s |   2,689 MB |   5,978 MB |   351.8 MB → 941.6 MB |
+| medium-cpp |      19.8 s |      34.9 s |   3,198 MB |   9,362 MB |   481.4 MB →  1.69 GB |
+
+Against the starting point (v0.1.0: medium 24.3 s / 3,021 MB / 265 MB output; medium-cpp
+31.2 s / 3,973 MB / 400 MB):
+
+- The pipeline work itself is far cheaper: `-c -a` on small went from 22 s to 1.2 s (the
+  per-unit whole-map passes are gone), user time on medium is 27 s against 33 s, and the
+  per-merge cost no longer grows with the number of units, which is what made the kernel
+  11× more expensive per MB than PostgreSQL.
+- Wall and RSS on the medium inputs are now dominated by the result itself: three to four
+  times the positions, held in `std::set<SlicePosition>` (each position carries its file
+  name as a `std::string`) and then serialised into one in-memory string before it is
+  written (the output phase alone accounts for roughly half of the peak, as noted in
+  `findings.md`). medium-cpp spends most of its 35 s producing 1.7 GB of JSON.
+- Whether slices of this size are wanted is a product decision, not a performance one; see
+  the options in the recap (cap the propagation depth, keep the complete closure, or compute
+  it exactly with a fixpoint). The memory items in `findings.md` (shared file-name strings,
+  streaming the output) become the next lever either way.

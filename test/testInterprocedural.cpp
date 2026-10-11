@@ -121,8 +121,8 @@ void second() {
 
 // Defect: v is resolved once at merge time against whatever p carried at that moment and is
 // never revisited; whether bar's data reaches v depends on unit and map order (one unit
-// order passes today, the other does not). Expected to flip in Step 2b.
-TEST_CASE("Interprocedural: callee in a later unit passes the parameter on", "[srcslice][interprocedural][!mayfail]") {
+// order passed, the other did not). Passes since Step 2b (single resolution pass).
+TEST_CASE("Interprocedural: callee in a later unit passes the parameter on", "[srcslice][interprocedural]") {
     std::vector<std::string> files = {
 R"(int main() {
     int v = 0;
@@ -314,7 +314,7 @@ void setp(int* p) {
 // unresolved (callee later) or resolved without any data flowing (callee first), because
 // ResolveCall/ArgumentProfile pick profiles by bare name and `.back()`. Same family as the
 // write-target defect; expected to flip with Steps 2a1/2a2.
-TEST_CASE("Interprocedural: argument named like the parameter", "[srcslice][interprocedural][!mayfail]") {
+TEST_CASE("Interprocedural: argument named like the parameter", "[srcslice][interprocedural]") {
     std::vector<std::string> files = {
 R"(int main() {
     int r = 0;
@@ -338,9 +338,9 @@ R"(void setr(int& r) {
 
 // Defect: a global's fragments are glued into its root, but the root is never `partial`, so
 // the call its fragment carried keeps an empty definitionPosition and take's data never
-// reaches g. Expected to flip in Step 2b (every declared profile goes through UpdateCalls).
+// reaches g. Passes since Step 2b (every declared profile goes through UpdateCalls).
 TEST_CASE("Interprocedural: global defined in a header, used and passed on in other units",
-          "[srcslice][interprocedural][!mayfail]") {
+          "[srcslice][interprocedural]") {
     std::vector<std::string> files = {
 R"(inline int g = 0;
 )",
@@ -369,11 +369,11 @@ R"(void take(int t) {
     REQUIRE( CheckBothOrders(CurrentTest(), files, {"g.hpp", "u2.cpp", "u3.cpp", "u4.cpp"}, expected) );
 }
 
-// Defect: m is resolved when its unit is merged, while ping's parameter is still frozen
-// (`visited`) without pong's data; m is never revisited, so y's definition two hops away
-// and pong's definition position are missing. Expected to flip in Step 2b.
+// Mutual recursion across units: m reaches ping's x, pong's y and the call back into ping.
+// Passes since Step 2b (resolution runs once after all units are merged; before, m was
+// resolved while ping's parameter was still frozen without pong's data).
 TEST_CASE("Interprocedural: mutual recursion across units reaches the caller",
-          "[srcslice][interprocedural][!mayfail]") {
+          "[srcslice][interprocedural]") {
     std::vector<std::string> files = {
 R"(void ping(int x) {
     pong(x);
@@ -393,9 +393,11 @@ int main() {
 }
 )"};
     std::vector<std::string> names = {"u1.cpp", "u2.cpp", "u3.cpp"};
+    // m flows into ping's x, from there into pong's y, and from y back into ping (u2:4:5)
     json expectedCalls = R"({
     "m-4-9":{"calls":[{"functionName":"ping","parameter":"1","definitionPosition":"u1.cpp:1:1","invoke":"u3.cpp:5:5"},
-                      {"functionName":"pong","parameter":"1","definitionPosition":"u2.cpp:2:1","invoke":"u1.cpp:2:5"}]}
+                      {"functionName":"pong","parameter":"1","definitionPosition":"u2.cpp:2:1","invoke":"u1.cpp:2:5"},
+                      {"functionName":"ping","parameter":"1","definitionPosition":"u1.cpp:1:1","invoke":"u2.cpp:4:5"}]}
     })"_json;
     for (int pass = 0; pass < 2; ++pass) {
         json produced = json::parse(FetchSlices(files, names, data));
