@@ -1,11 +1,11 @@
 {
  "input": "small-ca",
  "input_commit": "61c1a33a57e3c90b67a7cdf05971f13cce0c6aea",
- "created": "2026-10-11T00:29:21Z",
- "note": "2b: appends-only merge; one Finalize pass (control edges, fragments, UpdateCalls+ResolveCall for declared profiles, alias fixpoint)",
- "version": "0.2.1",
+ "created": "2026-10-11T03:06:15Z",
+ "note": "srcDispatch ControlPolicy close handler now resets (missing return): a for loop after another one no longer inherits the previous loop control data",
+ "version": "0.2.7",
  "srcslice": {
-  "commit": "1888e59b5773e72e0bb4b2fa799d1c68bc8acb7f",
+  "commit": "caccb590111d277a0bb2698638c5b1000d26fa85",
   "dirty": true,
   "build_type": "Release"
  },
@@ -19,9 +19,9 @@
  "entries": 4669,
  "unparsed_entries": 8,
  "files": 22,
- "sha256": "d896ed6f03745028c99d5a33fe2b823c4fbdcb9b2e955320e97b1c64290024bc",
+ "sha256": "5089367f5c7e58094409981dbc115c7dd985782af79d0b8238c4f4376b252136",
  "per_file": {
-  "src/catch2/catch.hpp": "d7de5d04ffe76425:2914",
+  "src/catch2/catch.hpp": "2bea206fea679778:2914",
   "src/cpp/main.cpp": "6af5af3b33606f12:23",
   "src/cpp/srcslicecollection.cpp": "e97c16b9f0d54af7:55",
   "src/cpp/srcslicehandler.cpp": "5395b5f6623159f6:112",

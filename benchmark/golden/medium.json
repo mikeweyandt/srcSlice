@@ -1,11 +1,11 @@
 {
  "input": "medium",
  "input_commit": "f58ab18a90460cd297249bc80b13d84b2671bf0c",
- "created": "2026-10-11T00:29:21Z",
- "note": "2b: appends-only merge; one Finalize pass (control edges, fragments, UpdateCalls+ResolveCall for declared profiles, alias fixpoint)",
- "version": "0.2.1",
+ "created": "2026-10-11T03:06:15Z",
+ "note": "srcDispatch ControlPolicy close handler now resets (missing return): a for loop after another one no longer inherits the previous loop control data",
+ "version": "0.2.7",
  "srcslice": {
-  "commit": "1888e59b5773e72e0bb4b2fa799d1c68bc8acb7f",
+  "commit": "caccb590111d277a0bb2698638c5b1000d26fa85",
   "dirty": true,
   "build_type": "Release"
  },

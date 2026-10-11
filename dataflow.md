@@ -44,12 +44,15 @@ performance work of October 2026 (`progress.md` has the step-by-step record; sec
   `start_root` → `start_element_ns_first` → `start_element_ns`, and `characters_first` →
   `characters_unit`, so per-element work after the first unit is `start_element_ns` (`:572`),
   `end_element_ns` (`:653`) and `characters_unit` (`:891`).
-- Per element, the C layer: `calloc`s a `srcsax_namespace`/`srcsax_attribute` array and `strndup`s
-  every attribute value (`libxml2_attributes2srcsax_attributes`, `:108`), `calloc`s the
-  qualified element name and pushes it on `srcml_element_stack` (`:149`), calls the C++ handler, then
-  frees everything (`:633-634`). The `srcsax_handler` function table it calls is filled by
-  `cppCallbackAdapter::factory()` (`srcSAXController.cpp:377`), which forwards to the virtual methods of
-  `srcSAXHandler` implemented by `srcDispatcher`.
+- Per element, the C layer converts the libxml2 attribute and namespace arrays into
+  `srcsax_attribute`/`srcsax_namespace` arrays owned by the parser state
+  (`scratch_srcsax_attributes`: one reused array and one value buffer, valid until the next
+  element; until v0.2.7 this was a `calloc`, a `strndup` per attribute and the frees), pushes the
+  qualified element name on `srcml_element_stack` (the string lives in a deque on the state) and
+  calls the C++ handler. The root and meta-tag paths, which nest a second conversion inside the
+  first, still use the allocating `libxml2_attributes2srcsax_attributes`. The `srcsax_handler`
+  function table it calls is filled by `cppCallbackAdapter::factory()` (`srcSAXController.cpp:377`),
+  which forwards to the virtual methods of `srcSAXHandler` implemented by `srcDispatcher`.
 
 ## 2. srcDispatcher: element names → events
 
@@ -58,16 +61,22 @@ performance work of October 2026 (`progress.md` has the step-by-step record; sec
 
 - `startUnit` (`:874`) copies the unit attributes into `ctx.currentFilePath`, `currentFileLanguage`,
   `currentFileChecksum`, `currentsrcMLRevision` (`:887-893`).
-- `startElement` (`:910`): builds a `std::string` for the qualified name, scans the attributes
-  (`pos:start`/`pos:end` are parsed into `ctx.startPosition`/`ctx.endPosition` through
-  `Position(const std::string&)`, `policy_classes/Position.cpp:19`, two `substr` + two `stoi` per
-  element), stores every attribute into the `std::map<std::string,std::string> ctx.attributes`
-  (`:981-982`, cleared again at `:991`), looks the name up in `process_map`
-  (`std::unordered_map<std::string, std::function<void()>>`, `:986`) and runs the lambda, which bumps
-  `ctx.triggerField[state]` and calls `DispatchEvent(state, open)`. A second loop then fires one
-  `xmlattribute` event per attribute (`:1009-1022`).
-- `charactersUnit` (`:1035`) copies the text into `ctx.currentToken` and fires the `tokenstring` event.
-- `endElement` (`:1069`) mirrors `startElement` through `process_map2`.
+- `startElement`: assembles the qualified name in a reused buffer (`tagName`, also copied to
+  `ctx.currentTag`), scans the attributes (`pos:start`/`pos:end` are parsed into
+  `ctx.startPosition`/`ctx.endPosition` by `Position(const char*)`, `policy_classes/Position.cpp`,
+  in place; anything that is not `digits:digits` falls back to the `std::string` constructor),
+  points `ctx.attributeList`/`attributeCount` at the raw attribute array for the duration of the
+  open event (`ctx.GetAttribute("stereotype")` is the only reader; the per-element
+  `std::map<std::string,std::string> ctx.attributes` was removed in v0.2.7), looks the name up in
+  `process_map` (`std::unordered_map<std::string, std::function<void()>>`) and runs the lambda,
+  which bumps `ctx.triggerField[state]` and calls `DispatchEvent(state, open)`. One `xmlattribute`
+  event per attribute follows, but only when the listener on top of the stack has a handler for
+  it (`EventListener::HasCloseHandler`); none of the policies does.
+- `charactersUnit` copies the text into `ctx.currentToken` and fires the `tokenstring` event when
+  the listener on top handles text.
+- `endElement` mirrors `startElement` through `process_map2`. The handlers of the `unit`,
+  `tokenstring` and `xmlattribute` events are resolved once (`ResolveSpecialHandlers`) rather than
+  looked up by string per element or text node.
 - `DispatchEvent` (`:91`) always delivers to the **top** of the listener stack
   (`elementListeners.back()->HandleEvent(...)`). `EventListener::HandleEvent`
   (`srcDispatchUtilities.hpp:256`) looks the state up in the listener's own
@@ -92,10 +101,12 @@ example:
 2. On its own close (`endDecl`, `:176`) it calls `NotifyAll(ctx)`
    (`srcDispatchUtilities.hpp:382`): every registered parent `PolicyListener::Notify` is called with
    the child policy pointer, and the parent pulls the data with `policy->Data<DeclData>()`
-   (`srcDispatchUtilities.hpp:374`) → `DataInner()` → **`std::make_shared<DeclData>(data)`**, a copy
-   of the struct (`DeclPolicy.hpp:120`). The child then resets its data. The parent wraps the
-   `shared_ptr` in a `DeltaElement<std::shared_ptr<T>>` and stores it (`DeclPolicy::Notify`,
-   `:122-142`: type, name, init/range/arguments).
+   (`srcDispatchUtilities.hpp`) → `DataInner()` → `HandOver(data)`, which **moves** the struct
+   into a `shared_ptr` on the first request of a `NotifyAll` and answers further requests with the
+   same pointer (until v0.2.8 every request deep-copied the struct,
+   `std::make_shared<DeclData>(data)`). The child's own copy is moved-from until its open handler
+   assigns a fresh one. The parent wraps the `shared_ptr` in a `DeltaElement<std::shared_ptr<T>>`
+   and stores it (`DeclPolicy::Notify`: type, name, init/range/arguments).
 3. `ctx.dispatcher->RemoveListener(nullptr)` (`:144`) pops the finished child off the stack.
 
 The result at `</unit>` is a tree of heap objects rooted in `UnitData` (`UnitPolicy.hpp:31`):
