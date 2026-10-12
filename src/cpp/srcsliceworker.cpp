@@ -17,10 +17,8 @@ SrcSliceWorker::SrcSliceWorker(std::shared_ptr<srcDispatch::UnitData> unitData, 
         
     sctx = SliceCtx(ctx);
     unit = std::move(unitData);
-    dispatched = false;
 }
 SrcSliceWorker::~SrcSliceWorker() {
-    WaitForJob();
 }
 
 void SrcSliceWorker::Perform() {
@@ -29,7 +27,6 @@ void SrcSliceWorker::Perform() {
         SrcSliceWorker* self;
         ~Publish() {
             self->jobFinished.store(true, std::memory_order_release);
-            if (self->onDone) self->onDone();
         }
     } publish{this};
 
@@ -52,19 +49,6 @@ void SrcSliceWorker::Perform() {
     // the unit model is dead once the Blob exists; drop it here so a unit waiting to be
     // merged costs only its Blob
     unit.reset();
-}
-
-void SrcSliceWorker::Start() {
-    if (dispatched) return;
-    dispatched = true;
-    work = std::thread(&SrcSliceWorker::Perform, this);
-}
-
-// ensure the work thread has closed safely
-void SrcSliceWorker::WaitForJob() {
-    if (work.joinable()) {
-        work.join();
-    }
 }
 
 bool SrcSliceWorker::Finished() {

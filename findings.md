@@ -6,7 +6,7 @@ the line numbers below are those of the reviewed revision. Everything listed is 
 change can fix, ordered by expected payoff. Measured numbers come from the dev container (Ubuntu
 26.04, 32 cores, Release build) unless noted.
 
-## Status (October 2026, srcslice v0.2.17)
+## Status (October 2026, srcslice v0.2.18)
 
 `progress.md` records each step with its gate and numbers. Done, in order: S2 + M5 (condition-variable
 manager, bounded backlog, in-order merge: output no longer depends on the thread count), S1 (one
@@ -22,23 +22,26 @@ vectors (`FlatSet`) for the profile's position, call, dependence, alias and edge
 the first part of M7, an `any` that holds the model's shared pointers in place (v0.2.12), and
 per-name flags for the dispatcher's tag tests (v0.2.13), a namespace cache in srcSAX and no
 teardown at exit (v0.2.14), S10, the archive parsed by several parsers at once (v0.2.15),
-`ResolveCall`'s callee positions merged level by level (v0.2.16), and Finalize's per-name
-passes and the output formatting on the worker threads (v0.2.17).
+`ResolveCall`'s callee positions merged level by level (v0.2.16), Finalize's per-name passes
+and the output formatting on the worker threads (v0.2.17), and S5, a pool of worker threads
+(v0.2.18).
 
-| input | wall v0.1.0 → v0.2.17 | max RSS v0.1.0 → v0.2.17 | output |
+| input | wall v0.1.0 → v0.2.18 | max RSS v0.1.0 → v0.2.18 | output |
 |---|---|---|---|
-| medium (PostgreSQL) | 24.3 s → 1.9 s | 3.0 GB → 1.3 GB | 265 MB → 942 MB |
-| medium-cpp (OpenCV) | 31.2 s → 3.3 s | 4.0 GB → 1.7 GB | 400 MB → 1.7 GB |
-| large (kernel minus drivers) | 1,623 s → 30 s | 23.7 GB → 9.8 GB | 1.9 GB → 10.2 GB |
+| medium (PostgreSQL) | 24.3 s → 1.8 s | 3.0 GB → 1.4 GB | 265 MB → 942 MB |
+| medium-cpp (OpenCV) | 31.2 s → 3.2 s | 4.0 GB → 1.7 GB | 400 MB → 1.7 GB |
+| large (kernel minus drivers) | 1,623 s → 24 s | 23.7 GB → 9.9 GB | 1.9 GB → 10.2 GB |
+| x-large (full kernel) | killed after ~64 min → 153 s | 46.6 GB at death → 36.2 GB | — → 41.7 GB |
 | small with `-c -a` | 22.0 s → 0.20 s | 81 MB → 52 MB | 4.7 MB → 5.7 MB |
 
 The output grew because the slices now carry the full transitive closure through the call graph;
 before, resolution was frozen after each unit's merge and most cross-unit data never arrived (or
 arrived in the wrong entry, see "Correctness issues"). In recursive call families the closure a
 profile gets still depends on the traversal order of the depth-first `ResolveCall` (documented in
-`progress.md`, Step 2b; a fixpoint would make it exact). Still open: S5, the worker-side scans of S6
-(`findValidProfile`, `FetchSliceProfile`, off the critical path), S7, S9, M4, M7; `x-large` has
-not been re-run. With the parse spread over sixteen parsers and the output over eight threads,
+`progress.md`, Step 2b; a fixpoint would make it exact). Still open: the worker-side scans of S6
+(`findValidProfile`, `FetchSliceProfile`, off the critical path), S7, S9, M4, the rest of M7.
+`x-large` (the full kernel) runs in 153 s and 36.2 GB at v0.2.18 (one repeat, inside the 40 GB
+container cap; killed at v0.1.0). With the parse spread over sixteen parsers and the output over eight threads,
 medium's 1.9 s are about 1.1 s of parsing, 0.6 s of `Finalize` (`ResolveCall`, on one thread)
 and 0.2 s of output; the memory cost of a parser is the unit model it is building (about 18 MB
 each on medium). Measured and dropped: a direct-indexed
@@ -392,8 +395,9 @@ Not performance, but worth a ticket each:
    model's `any` in place~~ (done, v0.2.12); ~~parallel parse~~ (S10, done, v0.2.15). Next:
    ~~`Finalize`'s per-name passes and the output phase~~ (done, v0.2.16-v0.2.17). What is left
    on one thread is `ResolveCall`; its call-entry merges wait for the set-ordering decision
-   (correctness issues). Then the rest of M7 (`DeltaElement`'s two optionals per link, the
-   per-token string appends), M4 (slim fragments), S7, S5 (thread pool).
+   (correctness issues). ~~S5~~ (done, v0.2.18). Then the workers' own cost (allocation churn,
+   string formatting in the slicing code), the rest of M7 (`DeltaElement`'s two optionals per
+   link, the per-token string appends), M4 (slim fragments), S7.
 4. M7 if the above are not enough for the full kernel.
 
 Measure each step with `./benchmark/run.sh --sizes small,medium,medium-cpp`, confirm the tests
