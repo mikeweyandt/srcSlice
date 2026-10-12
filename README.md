@@ -68,9 +68,12 @@ is created. While the srcML release is still a GitHub draft, place the tarballs 
 `ctest --test-dir build -L srcslice` runs the unit tests (Catch2). Besides the original
 suites there are `testInterprocedural` (cross-unit call resolution, each program run in both
 unit orders), `testDeterminism` (the same archive must give identical slices for 1, 2 and 8
-threads and when repeated) and, from the threading work on, `testThreading`. Cases tagged
-`[!mayfail]` describe intended behaviour that a known defect still breaks; Catch reports them
-without failing the suite, and the comment above each names the change expected to fix it.
+threads and when repeated) and `testThreading` (the unit pipeline: every thread count and
+queue size gives the single-threaded result, the backlog / in-flight / worker bounds hold, a
+failing worker or a broken archive throws `std::runtime_error` out of the constructor). Cases
+tagged `[!mayfail]` describe intended behaviour that a known defect still breaks; Catch
+reports them without failing the suite, and the comment above each names the change expected
+to fix it. `progress.md` logs each performance step with its gate results and numbers.
 
 Sanitizer builds instrument srcSlice and the srcDispatch/srcSAX submodules:
 ```bash

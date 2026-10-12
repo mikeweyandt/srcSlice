@@ -104,13 +104,16 @@ moved) and `cache/golden/<input>.canon.gz` keeps the full canonical output that 
 entry-level diff needs. Entries srcslice writes as invalid JSON (it does not escape quotes
 in names such as `operator "" _a`) are compared as text.
 
-**Goldens are recorded and checked single-threaded (`-t 1`).** With several threads
-srcslice's interprocedural pass sees units in a timing-dependent order and the `use` and
-`calls` sets change from run to run (8 of 22 files differ between two 32-thread runs of
-`small`), so only the single-threaded output is reproducible. When a threaded timing run
-differs from the golden, the check reruns that input with `-t 1` and reports
-`ok (-t 1); threaded run differs in N file(s)`; that N should drop to zero once the
-ordering dependence is fixed. Pass `-t` yourself in `--srcslice-args` to override.
+**Goldens are recorded with `-t 1` and must match at every thread count.** Since the
+in-order merge (perf plan Step 1) srcslice merges units in archive order whatever the thread
+count, so a threaded run is byte-for-byte reproducible and checked against the same golden.
+When a threaded timing run differs, the check reruns that input with `-t 1` to tell the two
+failure kinds apart: `THREADED OUTPUT DIFFERS in N file(s); -t 1 matches` is a threading
+defect (the merge order leaked into the result), a plain `MISMATCH` is an output change.
+Both make the run exit 1. `--allow-thread-divergence` downgrades the first kind to
+`ok (-t 1); threaded run differs in N file(s) (allowed)` for bisecting old commits. Before
+Step 1 the threaded output changed from run to run (8 of 22 files between two 32-thread runs
+of `small`) because interprocedural resolution saw units in completion order.
 
 When a change is *meant* to alter the output (a fixed slice), re-record and commit the
 goldens with the change:
@@ -161,6 +164,7 @@ Add `--format markdown` to paste either table into a PR.
 --verify                     slice each input once (-t 1), compare with golden/, exit 1 on a difference
 --save-golden [--force]      record the current output as the golden for the selected inputs
 --no-verify                  skip the output check after the timing runs
+--allow-thread-divergence    do not fail when only the threaded output differs (the -t 1 recheck matches)
 --diff-limit N               files detailed in a mismatch report (default 10)
 --diff-lines N               report lines echoed to the console (default 40)
 --diff-summary               on a mismatch, aggregate moved / lost / new positions over all changed files

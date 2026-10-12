@@ -76,9 +76,10 @@ TEST_CASE("Determinism: repeated single-threaded runs are identical", "[srcslice
     REQUIRE( same );
 }
 
-// Defect: with several threads units are merged in completion order and the result depends
-// on it (use/calls sets change between runs). Expected to pass after Step 1 (in-order merge).
-TEST_CASE("Determinism: thread count does not change the slices", "[srcslice][determinism][!mayfail]") {
+// Units are merged in archive order whatever the thread count (perf plan Step 1), so the
+// thread count must not show in the result. Before that step units were merged in completion
+// order and use/calls sets changed between runs.
+TEST_CASE("Determinism: thread count does not change the slices", "[srcslice][determinism]") {
     std::vector<std::string> contents, names;
     GenerateUnits(kUnits, contents, names);
     auto base = FetchCanonical(contents, names, WithThreads(1));
