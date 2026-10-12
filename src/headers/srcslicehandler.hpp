@@ -190,6 +190,10 @@ private:
     };
     std::unordered_map<DeclaredKey, std::vector<SliceProfile*>, DeclaredKeyHash> declaredByPosition;
     void BuildDeclaredIndex();
+    // Runs `work` on every name's profile vector, spread over the worker threads (the
+    // passes of Finalize that touch one name at a time: fragment gluing, call completion,
+    // the shrink pass). The first exception thrown is rethrown after every thread joined.
+    void ForEachProfileGroup(const std::function<void(std::vector<SliceProfile>&)>& work);
 
     std::vector<SlicePosition> loopdata;
     std::vector<SlicePosition> forloopdata;

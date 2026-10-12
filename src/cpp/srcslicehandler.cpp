@@ -746,6 +746,34 @@ SliceProfile* SrcSliceHandler::ParameterProfile(const FunctionSignatureData& fun
     return nullptr;
 }
 
+void SrcSliceHandler::ForEachProfileGroup(const std::function<void(std::vector<SliceProfile>&)>& work) {
+    std::vector<std::vector<SliceProfile>*> groups;
+    groups.reserve(profileMap.size());
+    for (auto& [name, profiles] : profileMap) groups.push_back(&profiles);
+
+    const std::size_t threads = std::min<std::size_t>(static_cast<std::size_t>(std::max(threadCount, 1)), groups.size());
+    if (threads <= 1) {
+        for (std::vector<SliceProfile>* group : groups) work(*group);
+        return;
+    }
+
+    std::vector<std::exception_ptr> errors(threads);
+    std::vector<std::thread> pool;
+    auto run = [&](std::size_t t) {
+        try {
+            for (std::size_t i = t; i < groups.size(); i += threads) work(*groups[i]);
+        } catch (...) {
+            errors[t] = std::current_exception();
+        }
+    };
+    for (std::size_t t = 1; t < threads; ++t) pool.emplace_back(run, t);
+    run(0);
+    for (std::thread& thread : pool) thread.join();
+    for (const std::exception_ptr& error : errors) {
+        if (error) std::rethrow_exception(error);
+    }
+}
+
 void SrcSliceHandler::BuildDeclaredIndex() {
     declaredByPosition.clear();
     for (auto& [name, profiles] : profileMap) {
@@ -830,19 +858,21 @@ void SrcSliceHandler::Finalize() {
 
     if (calculateControlEdges) ComputeControlPaths();
 
-    for (auto& [name, profiles] : profileMap) {
-        mergeFragments(profiles);
-    }
+    // each name's fragments are glued into that name's roots: independent per name, so on
+    // all threads (fileDependencyTable is only read)
+    ForEachProfileGroup([this](std::vector<SliceProfile>& profiles) { mergeFragments(profiles); });
 
     // nothing moves a profile from here on: index them by declaration position for
     // ParameterProfile (UpdateCalls and ResolveCall call it per call entry)
     BuildDeclaredIndex();
 
-    for (auto& [name, profiles] : profileMap) {
+    // a profile's call completion writes only its own call entries and reads the signature
+    // table and the index: on all threads too
+    ForEachProfileGroup([this](std::vector<SliceProfile>& profiles) {
         for (auto& profile : profiles) {
             if (profile.containsDeclaration) UpdateCalls(profile);
         }
-    }
+    });
     ComputeInterprocedural();
     declaredByPosition.clear();
 
@@ -851,6 +881,18 @@ void SrcSliceHandler::Finalize() {
         // real alias chain and bounds a pathological cycle
         for (int pass = 0; pass < 32 && ComputeAliasInterprocedural(); ++pass) {}
     }
+
+    // the sets grew by insertion in the workers and by merges here: drop their slack
+    ForEachProfileGroup([](std::vector<SliceProfile>& profiles) {
+        for (auto& profile : profiles) {
+            profile.definitions.shrink_to_fit();
+            profile.uses.shrink_to_fit();
+            profile.cfunctions.shrink_to_fit();
+            profile.dvars.shrink_to_fit();
+            profile.aliases.shrink_to_fit();
+            profile.controlEdges.shrink_to_fit();
+        }
+    });
 
     if (verboseMode || progressMode) std::cout << "[*] Finished Second-Pass" << "\n";
 }
@@ -1019,7 +1061,31 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
     if (!sp.cfunctions.empty()) {
         // calls made by the callee parameters this profile flows into; appended to sp after
         // the loop so the iteration over sp.cfunctions is not invalidated
-        std::set<FunctionCallData> complementaryCalls;
+        // What this profile receives from its callees' parameters is gathered here and
+        // merged into its sets once per set instead of once per callee (perf: those merges
+        // grew with the number of callees, and were three quarters of Finalize). The batches
+        // are flushed before a callee is resolved for the first time, because that
+        // resolution may read this profile (a recursive family) and must find what the
+        // callee-by-callee merge had left there. `definitions` stays callee by callee: its
+        // inserts interleave with erases; so do the call entries: their ordering is not a
+        // strict weak ordering (an unresolved call's empty definition position compares
+        // equivalent to any other), so the order of their merges decides which survive.
+        // (the ranges point into the callee parameters' sets, which a resolved parameter
+        // never changes again, and into their declaration positions)
+        std::vector<PositionSet::Range> useRanges;
+        std::vector<NamedPositionSet::Range> aliasRanges, dvarRanges;
+        std::vector<EdgeSet::Range> edgeRanges;
+        // calls made by the callee parameters this profile flows into; appended to sp after
+        // the loop so the iteration over sp.cfunctions is not invalidated
+        FlatSet<FunctionCallData> complementaryCalls;
+        auto rangeOf = [](const auto& set) { return std::make_pair(set.values().data(), set.values().data() + set.values().size()); };
+        auto flush = [&]() {
+            sp.uses.InsertRanges(useRanges);
+            sp.aliases.InsertRanges(aliasRanges);
+            sp.dvars.InsertRanges(dvarRanges);
+            sp.controlEdges.InsertRanges(edgeRanges);
+            useRanges.clear(); aliasRanges.clear(); dvarRanges.clear(); edgeRanges.clear();
+        };
 
         for (auto& cfunc : sp.cfunctions) {
             // if a cfunc ignore flag is enabled skip this index and continue
@@ -1069,15 +1135,23 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
                     if (param) {
                         // resolve the parameter first so that data two or more hops away has
                         // reached it before it is copied; the visited guard stops cycles
+                        if (!param->visited) flush();
                         ResolveCall(*param);
 
                         // the resolved data belongs to the profile being resolved, not to
                         // the last profile that happens to share its name
                         SliceProfile& profile = sp;
 
+                        // a parameter passed to its own function: its sets are this profile's,
+                        // which the merges below replace, so nothing may point into them. The
+                        // pending ranges go first (their order), then this callee directly.
+                        const bool self = (param == &sp);
+                        if (self) flush();
+
                         if (!param->isReference && !param->isPointer) {
                             // pass by value
-                            profile.uses.insert(param->definitions.begin(), param->definitions.end());
+                            if (self) profile.uses.insert(param->definitions.begin(), param->definitions.end());
+                            else useRanges.push_back(rangeOf(param->definitions));
                         } else {
                             // pass by reference
                             profile.definitions.insert(param->definitions.begin(), param->definitions.end());
@@ -1088,17 +1162,28 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
                             // Parameter initial declaration def line is considered a use towards the argument
                             profile.definitions.erase(param->declPosition);
                         }
-                        profile.uses.insert(param->declPosition);
-                        profile.uses.insert(param->uses.begin(), param->uses.end());
+                        if (self) {
+                            profile.uses.insert(param->declPosition);
+                            profile.uses.insert(param->uses.begin(), param->uses.end());
+                        } else {
+                            useRanges.emplace_back(&param->declPosition, &param->declPosition + 1);
+                            useRanges.push_back(rangeOf(param->uses));
+                        }
 
                         // ensure dependencies and aliases are within local-scope
                         if (profile.function == param->function) {
-                            profile.aliases.insert(param->aliases.begin(), param->aliases.end());
-                            profile.dvars.insert(param->dvars.begin(), param->dvars.end());
+                            if (self) {
+                                profile.aliases.insert(param->aliases.begin(), param->aliases.end());
+                                profile.dvars.insert(param->dvars.begin(), param->dvars.end());
+                            } else {
+                                aliasRanges.push_back(rangeOf(param->aliases));
+                                dvarRanges.push_back(rangeOf(param->dvars));
+                            }
                         }
 
                         // move the control edges over
-                        profile.controlEdges.insert(param->controlEdges.begin(), param->controlEdges.end());
+                        if (self) profile.controlEdges.insert(param->controlEdges.begin(), param->controlEdges.end());
+                        else edgeRanges.push_back(rangeOf(param->controlEdges));
 
                         // the parameter's own calls become calls of this profile (appended after the loop)
                         complementaryCalls.insert(param->cfunctions.begin(), param->cfunctions.end());
@@ -1113,6 +1198,7 @@ void SrcSliceHandler::ResolveCall(SliceProfile &sp) {
                 }
             }
         }
+        flush();
         // move cfunc data over
         sp.cfunctions.insert(complementaryCalls.begin(), complementaryCalls.end());
     }
