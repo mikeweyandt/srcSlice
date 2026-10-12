@@ -9,6 +9,8 @@
 
 #include "srcsliceprofile.hpp"
 
+#include <charconv>
+
 SliceProfile::SliceProfile() : containsDeclaration(false), potentialAlias(false), dereferenced(false),
                     isGlobal(false) { isPointer = false; isReference = false; }
 
@@ -64,111 +66,131 @@ bool SliceProfile::operator!=(const SliceProfile& rhs) const {
     return !(*this == rhs);
 }
 
-std::ostream& operator<<(std::ostream& out, SliceProfile& profile) {
-    out << "    \"file\":\"" << profile.file << "\"," << "\n";
-    out << "    \"language\":\"" << profile.language << "\"," << "\n";
-    
-    out << "    \"namespace\":[";
+namespace {
+    void AppendUnsigned(std::string& out, unsigned long long value) {
+        char buf[24];
+        auto r = std::to_chars(buf, buf + sizeof buf, value);
+        out.append(buf, static_cast<std::size_t>(r.ptr - buf));
+    }
+}
+
+// Byte-for-byte the document the std::string-per-position, stream-per-field version
+// produced; the entry is assembled in the caller's buffer and written once (perf plan,
+// output phase: the per-call ostream machinery was a tenth of the parse thread's time).
+void SliceProfile::AppendJson(std::string& out) const {
+    out += "    \"file\":\"";     out += file.str();                 out += "\",\n";
+    out += "    \"language\":\""; out += language.str();             out += "\",\n";
+
+    out += "    \"namespace\":[";
     bool first = true;
-    for (std::string& nameSpace : profile.containingNameSpaces) {
-        if (!first) {
-            out << ",";
-        }
-        out << "\"" << nameSpace.substr(0, nameSpace.find(' ')) << "\"";
+    for (const std::string& nameSpace : containingNameSpaces) {
+        if (!first) out += ',';
+        out += '"';
+        out.append(nameSpace, 0, nameSpace.find(' '));
+        out += '"';
         first = false;
     }
-    out << "]," << "\n";
+    out += "],\n";
 
-    out << "    \"class\":\"" << profile.nameOfContainingClass << "\"," << "\n";
-    out << "    \"function\":\"" << profile.function << "\"," << "\n";
-    out << "    \"type\":\"" << profile.variableType << "\"," << "\n";
-    out << "    \"name\":\"" << profile.variableName << "\"," << "\n";
-    
-    out << "    \"decl\":" << profile.declPosition.StartToString() << "," << "\n";
+    out += "    \"class\":\"";    out += nameOfContainingClass.str(); out += "\",\n";
+    out += "    \"function\":\""; out += function.str();             out += "\",\n";
+    out += "    \"type\":\"";     out += variableType.str();         out += "\",\n";
+    out += "    \"name\":\"";     out += variableName;               out += "\",\n";
 
-    out << "    \"dependence\":[";
+    out += "    \"decl\":";
+    declPosition.AppendStart(out);
+    out += ",\n";
+
+    out += "    \"dependence\":[";
     first = true;
-    for (const auto& dvar : profile.dvars) {
-        if (!first) {
-            out << ",";
-        }
-        out << "{\"" << dvar.first << "\":" << dvar.second.StartToString() << "}";
+    for (const auto& dvar : dvars) {
+        if (!first) out += ',';
+        out += "{\"";
+        out += dvar.first;
+        out += "\":";
+        dvar.second.AppendStart(out);
+        out += '}';
         first = false;
     }
-    out << "]," << "\n";
+    out += "],\n";
 
-    out << "    \"aliases\":[";
+    out += "    \"aliases\":[";
     first = true;
-    for (const auto& alias : profile.aliases) {
-        if (!first) {
-            out << ",";
-        }
-        out << "{\"" << alias.first << "\":" << alias.second.StartToString() << "}";
+    for (const auto& alias : aliases) {
+        if (!first) out += ',';
+        out += "{\"";
+        out += alias.first;
+        out += "\":";
+        alias.second.AppendStart(out);
+        out += '}';
         first = false;
     }
-    out << "]," << "\n";
+    out += "],\n";
 
-    out << "    \"calls\":[";
+    out += "    \"calls\":[";
     first = true;
-    for (const auto& cfunc : profile.cfunctions) {
-        if (!first) {
-            out << ",";
+    for (const auto& cfunc : cfunctions) {
+        if (!first) out += ',';
+        out += "{\"functionName\":\"";
+        out += cfunc.functionName.str();
+        out += "\",\"parameter\":\"";
+        AppendUnsigned(out, cfunc.parameterIndex);
+        out += "\",\"definitionPosition\":";
+        cfunc.funcPos.AppendStart(out);
+        if (expandCalls) {
+            out += ",\"endOfFunction\":";
+            cfunc.funcPos.AppendEnd(out);
         }
-        out << "{" <<
-                    "\"functionName\":\"" << cfunc.functionName;
-                    if (profile.expandCalls) {}
-                    out << "\",\"parameter\":\"" << cfunc.parameterIndex;
-                    out << "\",\"definitionPosition\":" << cfunc.funcPos.StartToString();
-                    if (profile.expandCalls) {
-                        out << ",\"endOfFunction\":" << cfunc.funcPos.EndToString();
-                    }
-                    out << ",\"invoke\":" << cfunc.invokePosition.StartToString() <<
-                "}";
+        out += ",\"invoke\":";
+        cfunc.invokePosition.AppendStart(out);
+        out += '}';
         first = false;
     }
-    out << "]," << "\n";
+    out += "],\n";
 
-    // "use": [ { "start": "2:10", "end": "2:17" }, ... ]
-    out << "    \"use\":[";
+    // "use": [ "file:line:col", ... ]
+    out += "    \"use\":[";
     first = true;
-    for (const auto& use : profile.uses) {
-        if (!first) {
-            out << ",";
-        }
-        out << use.StartToString();
+    for (const auto& use : uses) {
+        if (!first) out += ',';
+        use.AppendStart(out);
         first = false;
     }
-    out << "]," << "\n";
+    out += "],\n";
 
-    // "definition": [ { "start": "2:10", "end": "2:17" }, ... ]
-    out << "    \"definition\":[";
+    // "definition": [ "file:line:col", ... ]
+    out += "    \"definition\":[";
     first = true;
-    for (const auto& def : profile.definitions) {
-        if (!first) {
-            out << ",";
-        }
-        out << def.StartToString();
+    for (const auto& def : definitions) {
+        if (!first) out += ',';
+        def.AppendStart(out);
         first = false;
     }
 
-    if (profile.showControlEdges) {
-        out << "]," << "\n";
+    if (showControlEdges) {
+        out += "],\n";
 
-        out << "    \"controlEdges\":[";
+        out += "    \"controlEdges\":[";
         first = true;
-        for (const auto& edge : profile.controlEdges) {
-            if (!first) {
-                out << ",";
-            }
-            out << "[" << edge.first.StartToString() <<
-            "," << edge.second.StartToString() << "]";
+        for (const auto& edge : controlEdges) {
+            if (!first) out += ',';
+            out += '[';
+            edge.first.AppendStart(out);
+            out += ',';
+            edge.second.AppendStart(out);
+            out += ']';
             first = false;
         }
-        out << "]" << "\n";
+        out += "]\n";
     } else {
-        out << "]" << "\n";
+        out += "]\n";
     }
+}
 
+std::ostream& operator<<(std::ostream& out, SliceProfile& profile) {
+    std::string entry;
+    profile.AppendJson(entry);
+    out.write(entry.data(), static_cast<std::streamsize>(entry.size()));
     return out;
 }
 

@@ -105,6 +105,8 @@ int main(int argc, char **argv)
         sliceOutput << "{\n";
         bool writtenSlices = false;
 
+        // each entry is assembled in this buffer and written once
+        std::string entry;
         for (auto& profiles : sliceProfileMap) {
             for (auto& slice : profiles.second) {
                 if (!slice.containsDeclaration)
@@ -114,12 +116,16 @@ int main(int argc, char **argv)
                 // we need to set the respective bool true
                 slice.expandCalls = expandCalls;
 
-                if (writtenSlices) sliceOutput << ",\n";
+                entry.clear();
+                if (writtenSlices) entry += ",\n";
                 writtenSlices = true;
 
-                sliceOutput << "\"" << slice.jsonKey() << "\":{\n";
-                sliceOutput << slice;
-                sliceOutput << "}";
+                entry += '"';
+                entry += slice.jsonKey();
+                entry += "\":{\n";
+                slice.AppendJson(entry);
+                entry += '}';
+                sliceOutput.write(entry.data(), static_cast<std::streamsize>(entry.size()));
             }
         }
 

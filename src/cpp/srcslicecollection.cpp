@@ -9,6 +9,7 @@
 
 #include "srcslicecollection.hpp"
 
+#include <charconv>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -55,6 +56,53 @@ namespace {
     std::string PositionText(std::size_t line, std::size_t column) {
         return std::to_string(line) + ':' + std::to_string(column);
     }
+
+    // '"' + file + (":line:column" when present) + '"', without a temporary string
+    void WriteQuoted(std::ostream& out, const std::string& file, bool hasPosition, std::uint32_t line, std::uint32_t column) {
+        out.put('"');
+        if (!file.empty()) out.write(file.data(), static_cast<std::streamsize>(file.size()));
+        if (hasPosition) {
+            char buf[32];
+            buf[0] = ':';
+            auto r = std::to_chars(buf + 1, buf + sizeof buf, line);
+            *r.ptr++ = ':';
+            r = std::to_chars(r.ptr, buf + sizeof buf, column);
+            out.write(buf, r.ptr - buf);
+        }
+        out.put('"');
+    }
+}
+
+namespace {
+    void AppendQuoted(std::string& out, const std::string& file, bool hasPosition, std::uint32_t line, std::uint32_t column) {
+        out.push_back('"');
+        out.append(file);
+        if (hasPosition) {
+            char buf[32];
+            buf[0] = ':';
+            auto r = std::to_chars(buf + 1, buf + sizeof buf, line);
+            *r.ptr++ = ':';
+            r = std::to_chars(r.ptr, buf + sizeof buf, column);
+            out.append(buf, static_cast<std::size_t>(r.ptr - buf));
+        }
+        out.push_back('"');
+    }
+}
+
+void SlicePosition::AppendStart(std::string& out) const {
+    AppendQuoted(out, GetFileName(), hasStart, startLine, startColumn);
+}
+
+void SlicePosition::AppendEnd(std::string& out) const {
+    AppendQuoted(out, GetFileName(), hasEnd, endLine, endColumn);
+}
+
+void SlicePosition::WriteStart(std::ostream& out) const {
+    WriteQuoted(out, GetFileName(), hasStart, startLine, startColumn);
+}
+
+void SlicePosition::WriteEnd(std::ostream& out) const {
+    WriteQuoted(out, GetFileName(), hasEnd, endLine, endColumn);
 }
 
 // Creates a String of a JSON object, ie: "file.cpp:2:12"
@@ -270,8 +318,13 @@ bool FunctionCallData::operator!=(const FunctionCallData& rhs) const {
 }
 
 bool FunctionCallData::operator<(const FunctionCallData& rhs) const {
-    if (functionName != rhs.functionName)
-        return functionName < rhs.functionName;
+    // interned: equal pointers are equal names; otherwise one three-way compare instead of an
+    // equality test followed by a less-than (set inserts of call entries are a hot path of
+    // ResolveCall)
+    if (functionName.ptr() != rhs.functionName.ptr()) {
+        const int order = functionName.str().compare(rhs.functionName.str());
+        if (order != 0) return order < 0;
+    }
     if (invokePosition != rhs.invokePosition)
         return invokePosition < rhs.invokePosition;
     if (argumentCount != rhs.argumentCount)

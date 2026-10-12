@@ -106,6 +106,15 @@ public:
     std::string StartToString() const;
     std::string EndToString() const;
 
+    // the same text as StartToString()/EndToString(), written straight into the stream (the
+    // JSON writer emits millions of positions; building a std::string for each was half of
+    // the output phase on medium)
+    void WriteStart(std::ostream& out) const;
+    void WriteEnd(std::ostream& out) const;
+    // the same text appended to a buffer
+    void AppendStart(std::string& out) const;
+    void AppendEnd(std::string& out) const;
+
     std::string RangeToString() const;
     std::string ToNameString() const;
 

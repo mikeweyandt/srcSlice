@@ -91,6 +91,9 @@ public:
     bool isFragment = false;
 
     std::string jsonKey() const;
+    // the entry's body (the lines between the braces) appended to a buffer; the stream
+    // operator writes the same bytes
+    void AppendJson(std::string& out) const;
     friend std::ostream& operator<<(std::ostream& out, SliceProfile& profile);
 };
 
