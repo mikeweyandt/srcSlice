@@ -689,9 +689,8 @@ void SrcSliceOperations::CreateSliceCallData(Blob& data, [[maybe_unused]] const 
     // push the cfunc data into the argument SliceProfile
     sliceProfile.cfunctions.insert(sliceCallData);
 
-    // if we do not have a functions decl position label the profile as partial
-    // to attempt to resolve the call once more units are processed
-    sliceProfile.partial = functionPosition.GetFileName().empty();
+    // a call whose function is not in this unit keeps an empty definition position; Finalize
+    // completes it from the full signature table (UpdateCalls)
 
     // attempt to mark the cfunc towards the currentPointerReference
 

@@ -1,0 +1,251 @@
+{
+  "meta": {
+    "version": "0.2.2",
+    "note": "2b: single Finalize pass (S1)",
+    "timestamp": "2026-10-11T00:32:37Z",
+    "hostname": "f44030a2e7be",
+    "platform": "Linux-7.2.3-ogc3.1.fc44.x86_64-x86_64-with-glibc2.43",
+    "machine": "x86_64",
+    "cpu_count": 32,
+    "mem_gb": 64.8,
+    "in_container": true,
+    "srcml_version": "srcml: 1.2.0",
+    "srcslice": {
+      "path": "/workspaces/srcSlice/build-release/bin/srcslice",
+      "build_type": "Release",
+      "compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+      "commit": "1888e59b5773e72e0bb4b2fa799d1c68bc8acb7f",
+      "dirty": true
+    },
+    "srcslice_args": [],
+    "threads": 32
+  },
+  "inputs": {
+    "small": {
+      "commit": "61c1a33a57e3c90b67a7cdf05971f13cce0c6aea",
+      "files": 22,
+      "source_bytes": 1112715,
+      "archive_bytes": 10876861,
+      "srcml_seconds": 0.27
+    },
+    "small-ca": {
+      "commit": "61c1a33a57e3c90b67a7cdf05971f13cce0c6aea",
+      "files": 22,
+      "source_bytes": 1112715,
+      "archive_bytes": 10876861,
+      "srcml_seconds": 0.27
+    },
+    "medium": {
+      "commit": "f58ab18a90460cd297249bc80b13d84b2671bf0c",
+      "files": 2565,
+      "source_bytes": 52901371,
+      "archive_bytes": 523987106,
+      "srcml_seconds": 1.28
+    },
+    "medium-cpp": {
+      "commit": "1e21d6ed7d44c4f7ae9efd4acf302d6cbdf32bff",
+      "files": 2277,
+      "source_bytes": 43271851,
+      "archive_bytes": 585599807,
+      "srcml_seconds": 4.35
+    }
+  },
+  "results": {
+    "small": {
+      "repeat": 5,
+      "wall_median_s": 0.1886,
+      "wall_min_s": 0.1834,
+      "user_s": 0.2217,
+      "sys_s": 0.0393,
+      "maxrss_mb": 78.5,
+      "output_bytes": 4371203,
+      "runs": [
+        {
+          "wall_s": 0.1834,
+          "user_s": 0.2134,
+          "sys_s": 0.0388,
+          "maxrss_mb": 78.5,
+          "output_bytes": 4371203
+        },
+        {
+          "wall_s": 0.1911,
+          "user_s": 0.2216,
+          "sys_s": 0.0393,
+          "maxrss_mb": 75.6,
+          "output_bytes": 4371203
+        },
+        {
+          "wall_s": 0.1858,
+          "user_s": 0.2265,
+          "sys_s": 0.0392,
+          "maxrss_mb": 77.4,
+          "output_bytes": 4371203
+        },
+        {
+          "wall_s": 0.1895,
+          "user_s": 0.2217,
+          "sys_s": 0.0402,
+          "maxrss_mb": 77.9,
+          "output_bytes": 4371203
+        },
+        {
+          "wall_s": 0.1886,
+          "user_s": 0.2238,
+          "sys_s": 0.0428,
+          "maxrss_mb": 77.1,
+          "output_bytes": 4371203
+        }
+      ],
+      "output_check": {
+        "status": "ok",
+        "entries": 4669,
+        "files": 22,
+        "unparsed_entries": 8,
+        "changed_files": 0,
+        "added_files": 0,
+        "removed_files": 0,
+        "digest_s": 0.08
+      }
+    },
+    "small-ca": {
+      "repeat": 5,
+      "wall_median_s": 1.1764,
+      "wall_min_s": 1.171,
+      "user_s": 1.2093,
+      "sys_s": 0.0364,
+      "maxrss_mb": 80.9,
+      "output_bytes": 5692009,
+      "runs": [
+        {
+          "wall_s": 1.171,
+          "user_s": 1.2032,
+          "sys_s": 0.0346,
+          "maxrss_mb": 80.7,
+          "output_bytes": 5692009
+        },
+        {
+          "wall_s": 1.1764,
+          "user_s": 1.2093,
+          "sys_s": 0.0404,
+          "maxrss_mb": 80.9,
+          "output_bytes": 5692009
+        },
+        {
+          "wall_s": 1.2344,
+          "user_s": 1.2662,
+          "sys_s": 0.0376,
+          "maxrss_mb": 80.5,
+          "output_bytes": 5692009
+        },
+        {
+          "wall_s": 1.2007,
+          "user_s": 1.2437,
+          "sys_s": 0.0269,
+          "maxrss_mb": 80.8,
+          "output_bytes": 5692009
+        },
+        {
+          "wall_s": 1.1725,
+          "user_s": 1.2084,
+          "sys_s": 0.0364,
+          "maxrss_mb": 79.8,
+          "output_bytes": 5692009
+        }
+      ],
+      "output_check": {
+        "status": "ok",
+        "entries": 4669,
+        "files": 22,
+        "unparsed_entries": 8,
+        "changed_files": 0,
+        "added_files": 0,
+        "removed_files": 0,
+        "digest_s": 0.1
+      }
+    },
+    "medium": {
+      "repeat": 3,
+      "wall_median_s": 25.3172,
+      "wall_min_s": 25.0009,
+      "user_s": 27.199,
+      "sys_s": 1.8314,
+      "maxrss_mb": 5977.7,
+      "output_bytes": 941594505,
+      "runs": [
+        {
+          "wall_s": 25.3316,
+          "user_s": 27.2301,
+          "sys_s": 1.814,
+          "maxrss_mb": 5965.0,
+          "output_bytes": 941594505
+        },
+        {
+          "wall_s": 25.0009,
+          "user_s": 26.9439,
+          "sys_s": 1.8353,
+          "maxrss_mb": 5977.7,
+          "output_bytes": 941594505
+        },
+        {
+          "wall_s": 25.3172,
+          "user_s": 27.199,
+          "sys_s": 1.8314,
+          "maxrss_mb": 5971.3,
+          "output_bytes": 941594505
+        }
+      ],
+      "output_check": {
+        "status": "ok",
+        "entries": 217200,
+        "files": 2419,
+        "unparsed_entries": 0,
+        "changed_files": 0,
+        "added_files": 0,
+        "removed_files": 0,
+        "digest_s": 14.23
+      }
+    },
+    "medium-cpp": {
+      "repeat": 3,
+      "wall_median_s": 34.8599,
+      "wall_min_s": 34.839,
+      "user_s": 35.826,
+      "sys_s": 2.5408,
+      "maxrss_mb": 9362.4,
+      "output_bytes": 1689385099,
+      "runs": [
+        {
+          "wall_s": 34.8774,
+          "user_s": 35.8782,
+          "sys_s": 2.5408,
+          "maxrss_mb": 9351.4,
+          "output_bytes": 1689385099
+        },
+        {
+          "wall_s": 34.8599,
+          "user_s": 35.7999,
+          "sys_s": 2.568,
+          "maxrss_mb": 9362.4,
+          "output_bytes": 1689385099
+        },
+        {
+          "wall_s": 34.839,
+          "user_s": 35.826,
+          "sys_s": 2.5156,
+          "maxrss_mb": 9355.7,
+          "output_bytes": 1689385099
+        }
+      ],
+      "output_check": {
+        "status": "ok",
+        "entries": 243246,
+        "files": 2055,
+        "unparsed_entries": 49357,
+        "changed_files": 0,
+        "added_files": 0,
+        "removed_files": 0,
+        "digest_s": 19.48
+      }
+    }
+  }
+}

@@ -72,13 +72,9 @@ public:
 
     std::set<std::pair<SlicePosition, SlicePosition>> controlEdges;
 
+    // set by ResolveCall: resolved once, and the cycle guard for recursive resolution
     bool visited = false;
-    bool updated = false;
 
-    // to be partial means this profile contains cfunction data
-    // that has not been fully resolved (unknown function decl)
-    bool partial = false;
-    
     bool showControlEdges = false;
     bool expandCalls = false;
 
