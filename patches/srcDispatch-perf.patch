@@ -1,0 +1,1633 @@
+diff --git a/src/dispatcher/srcDispatchUtilities.hpp b/src/dispatcher/srcDispatchUtilities.hpp
+index 3c59db8..25ae2e8 100644
+--- a/src/dispatcher/srcDispatchUtilities.hpp
++++ b/src/dispatcher/srcDispatchUtilities.hpp
+@@ -20,6 +20,7 @@
+ 
+ #include <memory>
+ #include <any>
++#include <Any.hpp>
+ #include <unordered_map>
+ #include <functional>
+ #include <string>
+@@ -30,6 +31,7 @@
+ #include <algorithm>
+ #include <iostream>
+ #include <stdexcept>
++#include <cstring>
+ 
+ #include <Diff.hpp>
+ #include <DeltaElement.hpp>
+@@ -114,9 +116,31 @@ namespace srcDispatch {
+ 
+             std::vector<std::string>  currentNamespaces;
+ 
+-            std::map<std::string, std::string> attributes;
++            // The current element's attributes as the SAX layer handed them over, valid while
++            // its open event is dispatched (perf plan S3: the std::map<std::string, std::string>
++            // that used to be filled and cleared for every element is gone; see GetAttribute).
++            const struct srcsax_attribute* attributeList = nullptr;
++            int attributeCount = 0;
+             bool isArchive, isPrev, isOperator, isPseudo, endArchive;
+ 
++            // The value of the current element's attribute with this qualified name
++            // ("prefix:localname", or "localname" without a prefix), nullptr when absent.
++            const char* GetAttribute(const char* qualifiedName) const {
++                for(int pos = 0; pos < attributeCount; ++pos) {
++                    const struct srcsax_attribute& attribute = attributeList[pos];
++                    if(attribute.prefix != nullptr) {
++                        const std::size_t prefixLength = std::strlen(attribute.prefix);
++                        if(std::strncmp(qualifiedName, attribute.prefix, prefixLength) != 0) continue;
++                        if(qualifiedName[prefixLength] != ':') continue;
++                        if(std::strcmp(qualifiedName + prefixLength + 1, attribute.localname) != 0) continue;
++                    } else if(std::strcmp(qualifiedName, attribute.localname) != 0) {
++                        continue;
++                    }
++                    return attribute.value;
++                }
++                return nullptr;
++            }
++
+           /**
+             * write_start_tag
+             * @param localname the name of the element tag
+@@ -249,6 +273,12 @@ namespace srcDispatch {
+ 
+             void SetDispatched(bool isDispatched) { dispatched = isDispatched; }
+ 
++            // whether this listener handles the event (a registered no-op counts); lets the
++            // dispatcher skip the events nobody listens to, e.g. one per attribute of every
++            // element (perf plan S3)
++            virtual bool HasOpenHandler(ParserState state) const { return openEventMap.find(state) != openEventMap.end(); }
++            virtual bool HasCloseHandler(ParserState state) const { return closeEventMap.find(state) != closeEventMap.end(); }
++
+             virtual const EventMap& GetOpenEventMap()  const { return openEventMap;  }
+             virtual const EventMap& GetCloseEventMap() const { return closeEventMap; }
+ 
+@@ -372,12 +402,28 @@ public:
+ 
+         template<typename T>
+         std::shared_ptr<T> Data() const {
+-            return std::any_cast<std::shared_ptr<T>>(DataInner());
++            return srcDispatch::any_cast<std::shared_ptr<T>>(DataInner());
+         }
+ 
+     protected:
+         std::list<PolicyListener*> policyListeners;
+-        virtual std::any DataInner() const = 0;
++        virtual srcDispatch::Any DataInner() const = 0;
++
++        // Hand-over without a deep copy (perf plan S4). DataInner() used to copy the policy's
++        // whole data struct into a fresh shared_ptr for every listener that asked, on every
++        // close of every element. HandOver moves the struct into the shared_ptr on the first
++        // request and answers the later requests of the same NotifyAll with the same pointer;
++        // NotifyAll forgets it afterwards. The policy's own copy is then in a moved-from state
++        // until its open handler assigns a fresh one, which every policy does before reading it.
++        template<class T>
++        srcDispatch::Any HandOver(const T& value) const {
++            if(!handedOver.has_value()) {
++                handedOver = std::make_shared<T>(std::move(const_cast<T&>(value)));
++            }
++            return handedOver;
++        }
++        mutable srcDispatch::Any handedOver;
++
+         //TODO: These may not need to be synchronous or even called in the same method (i.e., notifyall)
+         virtual void NotifyAll(/*const*/ srcSAXEventContext& ctx) {
+             for(std::list<PolicyListener*>::iterator listener = policyListeners.begin(); listener != policyListeners.end(); ++listener) {
+@@ -386,6 +432,7 @@ public:
+             for(std::list<PolicyListener*>::iterator listener = policyListeners.begin(); listener != policyListeners.end(); ++listener) {
+                 (*listener)->NotifyWrite(this, ctx);
+             }
++            handedOver.reset();
+ 
+         }
+ 
+diff --git a/src/dispatcher/srcDispatcher.hpp b/src/dispatcher/srcDispatcher.hpp
+index 89b3879..69e235b 100644
+--- a/src/dispatcher/srcDispatcher.hpp
++++ b/src/dispatcher/srcDispatcher.hpp
+@@ -35,6 +35,8 @@
+ #include <unordered_set>
+ #include <memory>
+ #include <cstring>
++#include <array>
++#include <cstdint>
+ 
+ namespace srcDispatch {
+ 
+@@ -83,9 +85,113 @@ namespace srcDispatch {
+ 
+         std::size_t numberAllocatedListeners;
+ 
+-        const std::unordered_set<std::string> nameCollectElements{ "class", "struct", "namespace" };
+         std::optional<std::string> collectedText;
+ 
++        // Per-element plumbing (perf plan S3). The handlers of the events every element or
++        // text node fires are resolved once instead of looked up by string each time
++        // (unordered_map nodes stay put across inserts, so the pointers are stable), and the
++        // qualified tag name is assembled in a reused buffer instead of a fresh std::string.
++        const std::function<void()>* unitOpenHandler = nullptr;
++        const std::function<void()>* unitCloseHandler = nullptr;
++        const std::function<void()>* attributeHandler = nullptr;
++        const std::function<void()>* tokenHandler = nullptr;
++        std::string tagName;
++
++        void ResolveSpecialHandlers() {
++            auto resolve = [](const std::unordered_map<std::string, std::function<void()>>& map, const char* event)
++                    -> const std::function<void()>* {
++                auto itr = map.find(event);
++                return itr != map.end() ? &itr->second : nullptr;
++            };
++            unitOpenHandler  = resolve(process_map, "unit");
++            unitCloseHandler = resolve(process_map2, "unit");
++            attributeHandler = resolve(process_map2, "xmlattribute");
++            tokenHandler     = resolve(process_map2, "tokenstring");
++            for(ElementSlot& slot : elementCache) slot = ElementSlot();
++            lastNonDiffUri = nullptr;
++        }
++
++        // Element handlers looked up by libxml2's name pointers. The parser interns element
++        // names in its dictionary, so a name arrives with the same pointer every time; a
++        // direct-mapped cache keyed on the (localname, prefix) pointers yields the open and
++        // close handlers without hashing the text for every element. Each hit is verified
++        // against the stored text, so a pointer that means something else (another parser
++        // context) only costs a miss. Reset whenever process_map/process_map2 change.
++        struct ElementSlot {
++            const char* localname = nullptr;
++            const char* prefix = nullptr;
++            std::string text;                          // "prefix:localname" or "localname"
++            const std::function<void()>* open = nullptr;
++            const std::function<void()>* close = nullptr;
++            // what startElement/endElement test the name for, decided once per distinct name
++            // instead of a string comparison per element and test
++            bool isArgumentList = false, isType = false, isFunctionLike = false, isBlock = false,
++                 isIf = false, isNamespace = false, isName = false, isSuperList = false;
++        };
++        std::array<ElementSlot, 1024> elementCache{};
++        const char* lastNonDiffUri = nullptr;
++
++        static bool SameQualifiedName(const std::string& text, const char* localname, const char* prefix) {
++            if(prefix == nullptr) return text == localname;
++            const std::size_t prefixLength = std::strlen(prefix);
++            return text.size() > prefixLength && text.compare(0, prefixLength, prefix) == 0
++                && text[prefixLength] == ':' && text.compare(prefixLength + 1, std::string::npos, localname) == 0;
++        }
++
++        ElementSlot& LookupElement(const char* localname, const char* prefix) {
++            const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(localname) >> 4;
++            const std::uintptr_t b = reinterpret_cast<std::uintptr_t>(prefix) >> 4;
++            ElementSlot& slot = elementCache[(a * 31u + b) % elementCache.size()];
++            if(slot.localname == localname && slot.prefix == prefix && SameQualifiedName(slot.text, localname, prefix)) {
++                return slot;
++            }
++            AssignQualifiedName(slot.text, localname, prefix);
++            slot.localname = localname;
++            slot.prefix = prefix;
++            auto open = process_map.find(slot.text);
++            slot.open = open != process_map.end() ? &open->second : nullptr;
++            auto close = process_map2.find(slot.text);
++            slot.close = close != process_map2.end() ? &close->second : nullptr;
++            slot.isArgumentList = slot.text == "argument_list";
++            slot.isType         = slot.text == "type";
++            slot.isFunctionLike = slot.text == "function" || slot.text == "function_decl";
++            slot.isBlock        = slot.text == "block";
++            slot.isIf           = slot.text == "if";
++            slot.isNamespace    = slot.text == "namespace";
++            slot.isName         = slot.text == "name";
++            slot.isSuperList    = slot.text == "super_list";
++            return slot;
++        }
++
++        // URI == DIFF_URI without comparing the text again for the pointer that was not it
++        // last time (libxml2 hands the namespace URI over as the same interned pointer)
++        bool IsDiffUri(const char* URI) {
++            if(URI == nullptr || URI == lastNonDiffUri) return false;
++            if(URI == DIFF_URI) return true;
++            lastNonDiffUri = URI;
++            return false;
++        }
++
++        static void AssignQualifiedName(std::string& out, const char* localname, const char* prefix) {
++            if(prefix == nullptr) {
++                out.assign(localname);
++                return;
++            }
++            out.assign(prefix);
++            out.push_back(':');
++            out.append(localname);
++        }
++
++        static bool IsNameCollectElement(const std::string& element) {
++            return element == "class" || element == "struct" || element == "namespace";
++        }
++
++        // the listener in charge handles this event; when not, the dispatch would reach no
++        // handler and is skipped (one event per attribute of every element, one per text node)
++        bool ListenerHandlesClose(ParserState state) const {
++            return !EventDispatcher::elementListeners.empty() && EventDispatcher::elementListeners.back()->HasCloseHandler(state);
++        }
++
+     protected:
+ 
+         virtual void DispatchEvent(srcDispatch::ParserState pstate, srcDispatch::ElementState estate) override {
+@@ -122,6 +228,7 @@ namespace srcDispatch {
+                 } );
+ 
+             process_map2.insert(closeEvent);
++            ResolveSpecialHandlers();
+ 
+         }
+ 
+@@ -136,6 +243,7 @@ namespace srcDispatch {
+         virtual void RemoveEvent(const std::string & event) {
+             process_map.erase(event);
+             process_map2.erase(event);
++            ResolveSpecialHandlers();
+         }
+ 
+         virtual void RemoveEvents(std::initializer_list<std::string> events) {
+@@ -817,6 +925,7 @@ namespace srcDispatch {
+                     ctx.triggerField[ParserState::tokenstring] = 0;
+                 } }
+             };            
++            ResolveSpecialHandlers();
+         }
+ 
+         virtual void startDocument() override {
+@@ -851,10 +960,7 @@ namespace srcDispatch {
+             if(is_archive && generateArchive) {
+                 ctx.write_start_tag(localname, prefix, URI, num_namespaces, namespaces, num_attributes, attributes);
+             }
+-            std::unordered_map<std::string, std::function<void()>>::const_iterator process = process_map.find("unit");
+-            if (process != process_map.end()) {
+-                process->second();
+-            }
++            if (unitOpenHandler) (*unitOpenHandler)();
+         }
+         /**
+         * startUnit
+@@ -879,10 +985,7 @@ namespace srcDispatch {
+             if (generateArchive) {
+                 ctx.write_start_tag(localname, prefix, URI, num_namespaces, namespaces, num_attributes, attributes);
+             }
+-            std::unordered_map<std::string, std::function<void()>>::const_iterator process = process_map.find("unit");
+-            if (process != process_map.end()) {
+-                process->second();
+-            }
++            if (unitOpenHandler) (*unitOpenHandler)();
+ 
+             if(num_attributes >= 3) {
+                 if (num_attributes >= 5)
+@@ -915,7 +1018,7 @@ namespace srcDispatch {
+                 ctx.write_start_tag(localname, prefix, URI, num_namespaces, namespaces, num_attributes, attributes);
+             }
+ 
+-            if(URI == DIFF_URI) {
++            if(IsDiffUri(URI)) {
+                 if(localname == std::string("ws")) return;
+ 
+                 static std::unordered_map<std::string, DiffOperation> diff_op_map = { 
+@@ -940,64 +1043,63 @@ namespace srcDispatch {
+             
+             ++ctx.depth;
+ 
+-            std::string localName = srcSAXHandler::get_qualified_name(localname, prefix);
+-            ctx.currentTag = localName;
++            // the handlers and the name tests come from the pointer-keyed cache; the first
++            // attribute's value is compared where it is
++            ElementSlot& element = LookupElement(localname, prefix);
++            ctx.currentTag = element.text;
++            const std::function<void()>* openHandler = element.open;
+ 
+-            // Re-think this.  At least use processed list later and think about having a special object.
+-            std::string name;
+-            if(num_attributes) {
+-                name = attributes[0].value;
+-            }
+-            if(name == "generic" && localName == "argument_list") {
++            const char* name = num_attributes ? attributes[0].value : "";
++            if(element.isArgumentList && name[0] == 'g' && strcmp(name, "generic") == 0) {
+                 ctx.genericDepth.push_back(ctx.depth);
+             }
+-            if(name == "prev" && localName == "type") {
++            if(element.isType && name[0] == 'p' && strcmp(name, "prev") == 0) {
+                 ctx.isPrev = true;
+             }
+-            if(name == "operator" && (localName == "function" || localName == "function_decl")) {
++            if(element.isFunctionLike && name[0] == 'o' && strcmp(name, "operator") == 0) {
+                 ctx.isOperator = true;
+             }
+-            if(name == "pseudo" && localName == "block") {
++            if(element.isBlock && name[0] == 'p' && strcmp(name, "pseudo") == 0) {
+                 ctx.isPseudo = true;
+             }
+ 
+-            if(name == "elseif" && localName == "if") {
+-                localName = "elseif";
++            bool isElseIf = false;
++            if(element.isIf && name[0] == 'e' && strcmp(name, "elseif") == 0) {
++                isElseIf = true;
++                tagName = "elseif";
+                 elseif_positions.push_back(element_stack.size());
++                auto process = process_map.find(tagName);
++                openHandler = process != process_map.end() ? &process->second : nullptr;
+             }
+ 
+-            if(localName != "") {
++            if(isElseIf || !element.text.empty()) {
+ 
+-                // form attribute map
++                // positions straight from the attribute values; the attribute list itself is
++                // reachable through the context for the handlers that read one (stereotype)
+                 for(int pos = 0; pos < num_attributes; ++pos) {
+-
+-                    std::string attributeName = srcSAXHandler::get_qualified_name(attributes[pos].localname, attributes[pos].prefix);
+-                    if(strcmp(attributes[pos].localname, "start") == 0) {
++                    const char* attributeName = attributes[pos].localname;
++                    if(attributeName[0] == 's' && strcmp(attributeName, "start") == 0) {
+                         ctx.startPosition = DeltaElement(Position(attributes[pos].value));
+-                    } else if(strcmp(attributes[pos].localname, "end") == 0) {
++                    } else if(attributeName[0] == 'e' && strcmp(attributeName, "end") == 0) {
+                         ctx.endPosition   = DeltaElement(Position(attributes[pos].value));
+                     }
+-
+-                    std::string attributeValue = attributes[pos].value;
+-                    ctx.attributes.emplace(attributeName, attributeValue);         
+-
+                 }
++                ctx.attributeList = attributes;
++                ctx.attributeCount = num_attributes;
+ 
+-                std::unordered_map<std::string, std::function<void()>>::const_iterator process = process_map.find(localName);
+-                if (process != process_map.end()) {
+-                    process->second();
+-                }
+-                // erase attribute now that call is over
+-                ctx.attributes.clear();
++                if (openHandler) (*openHandler)();
++                // the attributes are only valid during the element's open event
++                ctx.attributeList = nullptr;
++                ctx.attributeCount = 0;
+             }
+ 
+-            if(ctx.currentTag == "namespace") {
++            if(element.isNamespace) {
+                 ctx.currentNamespaces.emplace_back();
+             }
+ 
+-            if(ctx.currentTag == "name" && nameCollectElements.contains(element_stack.back())) {
++            if(element.isName && IsNameCollectElement(element_stack.back())) {
+                 collectedText = std::string();
+-            } else if(collectedText && (ctx.currentTag == "block" || ctx.currentTag == "super_list")) {
++            } else if(collectedText && (element.isBlock || element.isSuperList)) {
+                 if(element_stack.back() == "namespace") {
+                     ctx.currentNamespaces.back() = *collectedText;
+                 } else {
+@@ -1006,19 +1108,22 @@ namespace srcDispatch {
+                 collectedText = std::optional<std::string>();
+             }
+ 
+-            for(int pos = 0; pos < num_attributes; ++pos) {
++            // one event per attribute, only when the listener in charge handles them: none of
++            // the policies here does, and the empty dispatch cost more than the element itself
++            if(num_attributes && attributeHandler && ListenerHandlesClose(ParserState::xmlattribute)) {
++                for(int pos = 0; pos < num_attributes; ++pos) {
+ 
+-                ctx.currentAttributeName = "";
+-                if(attributes[pos].prefix) {
+-                    ctx.currentAttributeName += attributes[pos].prefix;
+-                    ctx.currentAttributeName += ':';
+-                }
+-                ctx.currentAttributeName += attributes[pos].localname;
+-                ctx.currentAttributeValue = attributes[pos].value;
++                    ctx.currentAttributeName = "";
++                    if(attributes[pos].prefix) {
++                        ctx.currentAttributeName += attributes[pos].prefix;
++                        ctx.currentAttributeName += ':';
++                    }
++                    ctx.currentAttributeName += attributes[pos].localname;
++                    ctx.currentAttributeValue = attributes[pos].value;
+ 
+-                std::unordered_map<std::string, std::function<void()>>::const_iterator process = process_map2.find("xmlattribute");
+-                process->second();                
++                    (*attributeHandler)();
+ 
++                }
+             }
+ 
+             ctx.isPrev = false;
+@@ -1033,33 +1138,28 @@ namespace srcDispatch {
+         * Overide for desired behaviour.
+         */
+         virtual void charactersUnit(const char * ch, int len) override {
+-            ctx.currentToken.clear();
+-            ctx.currentToken.append(ch, len);
+-            std::unordered_map<std::string, std::function<void()>>::const_iterator process = process_map2.find("tokenstring");
++            ctx.currentToken.assign(ch, len);
+ 
+             if(collectedText) {
+-        		collectedText->append(ch, len);
++                collectedText->append(ch, len);
++            }
++
++            // dispatched only to a listener that handles text (perf plan S3)
++            if(tokenHandler && ListenerHandlesClose(ParserState::tokenstring)) {
++                (*tokenHandler)();
+             }
+-            
+-            process->second();
+             if (generateArchive) { ctx.write_content(ctx.currentToken); }
+         }
+     
+         // end elements may need to be used if you want to collect only on per file basis or some other granularity.
+         virtual void endRoot(const char * localname, const char * prefix, const char * URI) override {
+-            std::unordered_map<std::string, std::function<void()>>::const_iterator process2 = process_map2.find("unit");
+-            if (process2 != process_map2.end()) {
+-                process2->second();
+-            }
++            if (unitCloseHandler) (*unitCloseHandler)();
+             if(is_archive && generateArchive) {
+                 xmlTextWriterEndElement(ctx.writer);
+             }            
+         }
+         virtual void endUnit(const char * localname, const char * prefix, const char * URI) override {
+-            std::unordered_map<std::string, std::function<void()>>::const_iterator process2 = process_map2.find("unit");
+-            if (process2 != process_map2.end()) {
+-                process2->second();
+-            }
++            if (unitCloseHandler) (*unitCloseHandler)();
+ 
+             if (generateArchive) { xmlTextWriterEndElement(ctx.writer); }
+             --ctx.depth;
+@@ -1068,28 +1168,30 @@ namespace srcDispatch {
+     
+         virtual void endElement(const char * localname, const char * prefix, const char * URI) override {
+ 
+-            if(URI == DIFF_URI) {
++            if(IsDiffUri(URI)) {
+                 if(localname == std::string("ws")) return;
+ 
+                 ctx.diffStack.pop_back();
+                 return;
+             }
+ 
+-            std::string localName =  srcSAXHandler::get_qualified_name(localname, prefix);
++            ElementSlot& element = LookupElement(localname, prefix);
++            const std::function<void()>* closeHandler = element.close;
+ 
++            bool isElseIf = false;
+             if(!elseif_positions.empty() && element_stack.size() == elseif_positions.back()) {
+-                localName = "elseif";
++                isElseIf = true;
++                tagName = "elseif";
+                 elseif_positions.pop_back();
++                auto process2 = process_map2.find(tagName);
++                closeHandler = process2 != process_map2.end() ? &process2->second : nullptr;
+             }
+ 
+-            ctx.currentTag = localName;
++            ctx.currentTag = isElseIf ? tagName : element.text;
+ 
+-            std::unordered_map<std::string, std::function<void()>>::const_iterator process2 = process_map2.find(localName);
+-            if (process2 != process_map2.end()) {
+-                process2->second();
+-            }
++            if (closeHandler) (*closeHandler)();
+ 
+-    	    if(ctx.currentTag == "namespace") {
++    	    if(element.isNamespace) {
+                 collectedText = std::optional<std::string>();
+ 	            ctx.currentNamespaces.pop_back();
+ 	        }
+diff --git a/src/policy_classes/BlockPolicy.cpp b/src/policy_classes/BlockPolicy.cpp
+index 25ee159..9d46823 100644
+--- a/src/policy_classes/BlockPolicy.cpp
++++ b/src/policy_classes/BlockPolicy.cpp
+@@ -31,7 +31,7 @@ namespace srcDispatch {
+ 
+     BlockPolicy::~BlockPolicy() {}
+ 
+-    std::any BlockPolicy::DataInner() const { return std::make_shared<BlockData>(data); }
++    srcDispatch::Any BlockPolicy::DataInner() const { return HandOver(data); }
+ 
+     void BlockPolicy::Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) {
+         if(typeid(DeclStmtPolicy) == typeid(*policy)) {
+@@ -43,19 +43,19 @@ namespace srcDispatch {
+         } else if(typeid(ReturnPolicy) == typeid(*policy)) {
+             data.statements.emplace_back(ctx.diffStack.back().operation, policy->Data<ReturnData>());
+         } else if(typeid(IfStmtPolicy) == typeid(*policy)) {
+-            data.statements.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<IfStmtData>()));
++            data.statements.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<IfStmtData>()));
+         } else if(typeid(SwitchPolicy) == typeid(*policy)) {
+-            data.statements.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<SwitchData>()));
++            data.statements.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<SwitchData>()));
+         } else if(typeid(WhilePolicy) == typeid(*policy)) {
+-            data.statements.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<WhileData>()));
++            data.statements.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<WhileData>()));
+         } else if(typeid(ForPolicy) == typeid(*policy)) {
+-            data.statements.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<ForData>()));
++            data.statements.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<ForData>()));
+         } else if(typeid(DoPolicy) == typeid(*policy)) {
+-            data.statements.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<DoData>()));
++            data.statements.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<DoData>()));
+         } else if(typeid(TryPolicy) == typeid(*policy)) {
+             data.statements.emplace_back(ctx.diffStack.back().operation, policy->Data<TryData>());
+         } else if(typeid(ThrowPolicy) == typeid(*policy)) {
+-            data.statements.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<ThrowData>()));
++            data.statements.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<ThrowData>()));
+         } else if(typeid(GotoPolicy) == typeid(*policy)) {
+             data.statements.emplace_back(ctx.diffStack.back().operation, policy->Data<GotoData>());
+         } else if(typeid(ConvertPlexerPolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/BlockPolicy.hpp b/src/policy_classes/BlockPolicy.hpp
+index d892a04..67d61e2 100644
+--- a/src/policy_classes/BlockPolicy.hpp
++++ b/src/policy_classes/BlockPolicy.hpp
+@@ -46,7 +46,7 @@ namespace srcDispatch {
+ 
+     struct BlockData : public ElementData {
+ 
+-        std::vector<DeltaElement<std::any>>                   statements;
++        std::vector<DeltaElement<srcDispatch::Any>>                   statements;
+         std::vector<DeltaElement<std::shared_ptr<ClassData>>> localClasses;
+         std::vector<DeltaElement<std::shared_ptr<LabelData>>> labels;
+         std::vector<DeltaElement<std::shared_ptr<CaseData>>>  cases;
+@@ -94,7 +94,7 @@ namespace srcDispatch {
+         ~BlockPolicy();
+ 
+     protected:
+-        std::any DataInner() const override;
++        srcDispatch::Any DataInner() const override;
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override;
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+diff --git a/src/policy_classes/CallPolicy.cpp b/src/policy_classes/CallPolicy.cpp
+index ca2d8ea..5e655d9 100644
+--- a/src/policy_classes/CallPolicy.cpp
++++ b/src/policy_classes/CallPolicy.cpp
+@@ -57,7 +57,7 @@ namespace srcDispatch {
+ 
+     CallPolicy::~CallPolicy() {}
+ 
+-    std::any CallPolicy::DataInner() const { return std::make_shared<CallData>(data); }
++    srcDispatch::Any CallPolicy::DataInner() const { return HandOver(data); }
+ 
+     void CallPolicy::Notify(const srcDispatch::PolicyDispatcher *policy, const srcDispatch::srcSAXEventContext& ctx) {
+         using namespace srcDispatch;
+diff --git a/src/policy_classes/CallPolicy.hpp b/src/policy_classes/CallPolicy.hpp
+index fdbda06..90468c7 100644
+--- a/src/policy_classes/CallPolicy.hpp
++++ b/src/policy_classes/CallPolicy.hpp
+@@ -71,7 +71,7 @@ namespace srcDispatch {
+         ~CallPolicy();
+ 
+     protected:
+-        std::any DataInner() const override;
++        srcDispatch::Any DataInner() const override;
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override;
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+diff --git a/src/policy_classes/CatchPolicy.hpp b/src/policy_classes/CatchPolicy.hpp
+index 2973524..06acffb 100644
+--- a/src/policy_classes/CatchPolicy.hpp
++++ b/src/policy_classes/CatchPolicy.hpp
+@@ -52,7 +52,7 @@ namespace srcDispatch {
+         ~CatchPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<CatchData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(DeclPolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/ClassPolicy.hpp b/src/policy_classes/ClassPolicy.hpp
+index 08c8ab9..b5f3e68 100644
+--- a/src/policy_classes/ClassPolicy.hpp
++++ b/src/policy_classes/ClassPolicy.hpp
+@@ -164,7 +164,7 @@ namespace srcDispatch {
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<ClassData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+     private:
+         void InitializeClassPolicyHandlers() {
+@@ -179,9 +179,8 @@ namespace srcDispatch {
+                     data.startPosition = ctx.startPosition;
+                     data.endPosition   = ctx.endPosition;
+                     data.accessSpecifier = NULL_ACCESS;
+-                    std::map<std::string, std::string>::const_iterator stereotype_attr_itr = ctx.attributes.find("stereotype");
+-                    if(stereotype_attr_itr != ctx.attributes.end()) {
+-                        std::istringstream stereostring(stereotype_attr_itr->second);
++                    if(const char* stereotype = ctx.GetAttribute("stereotype")) {
++                        std::istringstream stereostring(stereotype);
+                         data.stereotypes = std::set<std::string>(std::istream_iterator<std::string>(stereostring), std::istream_iterator<std::string>());
+                     }
+ 
+diff --git a/src/policy_classes/ConditionPolicy.hpp b/src/policy_classes/ConditionPolicy.hpp
+index 85fdc19..0ab832f 100644
+--- a/src/policy_classes/ConditionPolicy.hpp
++++ b/src/policy_classes/ConditionPolicy.hpp
+@@ -28,7 +28,7 @@ namespace srcDispatch {
+ 
+     struct ConditionData : public ElementData {
+ 
+-        std::vector<DeltaElement<std::any>> conditions;
++        std::vector<DeltaElement<srcDispatch::Any>> conditions;
+ 
+         template<class type>
+         friend class DeltaElement;
+@@ -38,7 +38,7 @@ namespace srcDispatch {
+ 
+             std::string str;
+             bool printComma = false;
+-            for (const DeltaElement<std::any>& condition : conditions) {
++            for (const DeltaElement<srcDispatch::Any>& condition : conditions) {
+ 
+                 bool outputRaw = condition.IsOfOperation(operation);
+                 if(outputRaw) {
+@@ -81,7 +81,7 @@ namespace srcDispatch {
+         ~ConditionPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<ConditionData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(ExpressionPolicy) == typeid(*policy)) {
+@@ -95,8 +95,8 @@ namespace srcDispatch {
+                 std::shared_ptr<DeclData> decl = policy->Data<DeclData>();
+                 if(data.conditions.size() && decl->type->types.empty()
+                  && data.conditions.back().GetElement().type() == typeid(std::shared_ptr<DeclData>)) {
+-                    decl->type     = std::any_cast<std::shared_ptr<DeclData>>(data.conditions.back().GetElement())->type;
+-                    decl->isStatic = std::any_cast<std::shared_ptr<DeclData>>(data.conditions.back().GetElement())->isStatic;
++                    decl->type     = srcDispatch::any_cast<std::shared_ptr<DeclData>>(data.conditions.back().GetElement())->type;
++                    decl->isStatic = srcDispatch::any_cast<std::shared_ptr<DeclData>>(data.conditions.back().GetElement())->isStatic;
+                 }
+                 srcDispatch::DiffOperation operation = ctx.diffStack.back().operation;
+                 data.conditions.emplace_back(operation, decl);
+diff --git a/src/policy_classes/ConditionalPolicy.hpp b/src/policy_classes/ConditionalPolicy.hpp
+index d467f75..270e0c3 100644
+--- a/src/policy_classes/ConditionalPolicy.hpp
++++ b/src/policy_classes/ConditionalPolicy.hpp
+@@ -60,7 +60,7 @@ namespace srcDispatch {
+         ~ConditionalPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<ConditionalDataParam>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(ConditionPolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/ControlPolicy.hpp b/src/policy_classes/ControlPolicy.hpp
+index ceb6b28..afb61e3 100644
+--- a/src/policy_classes/ControlPolicy.hpp
++++ b/src/policy_classes/ControlPolicy.hpp
+@@ -82,7 +82,7 @@ namespace srcDispatch {
+         ~ControlPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<ControlData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             using namespace srcDispatch;
+@@ -119,7 +119,10 @@ namespace srcDispatch {
+ 
+             // end of policy
+             closeEventMap[ParserState::control] = [this](srcSAXEventContext& ctx) {
+-                if(!depth || depth != ctx.depth)
++                // the missing return made `depth = 0` the body of the if: a normal close kept
++                // depth set, the next <control> open was ignored and that loop was handed the
++                // previous loop's data (stale condition/incr for a range-based for)
++                if(!depth || depth != ctx.depth) return;
+ 
+                 depth = 0;
+                 NotifyAll(ctx);
+diff --git a/src/policy_classes/ConvertPlexerPolicy.hpp b/src/policy_classes/ConvertPlexerPolicy.hpp
+index 3a7b9c0..e6d4349 100644
+--- a/src/policy_classes/ConvertPlexerPolicy.hpp
++++ b/src/policy_classes/ConvertPlexerPolicy.hpp
+@@ -35,7 +35,7 @@
+ namespace srcDispatch {
+ 
+     struct ConvertData : public ElementData {
+-        DeltaElement<std::any> construct;
++        DeltaElement<srcDispatch::Any> construct;
+     };
+ 
+     class ConvertPlexerPolicy :
+@@ -72,6 +72,11 @@ protected:
+ 
+         ~ConvertPlexerPolicy() {}
+ 
++        // events are forwarded to the original/modified policy stacks, not looked up in this
++        // listener's own tables, so the dispatcher must never skip one on its behalf
++        bool HasOpenHandler(srcDispatch::ParserState) const override { return true; }
++        bool HasCloseHandler(srcDispatch::ParserState) const override { return true; }
++
+         void Stop() {
+             dispatched = true;
+             EventDispatcher* currentDispatcher = dispatcherStack.top()->GetContext().dispatcher;
+@@ -214,14 +219,14 @@ protected:
+         }
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<ConvertData>(data); }
++        srcDispatch::Any DataInner() const override { return std::make_shared<ConvertData>(data); }
+ 
+         void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+ #ifdef CONVERT_DEBUG 
+             std::cerr << "HERE: " << std::string(index * 4, ' ') << index << ' ' << __LINE__ << ' ' <<  '\n';
+ #endif
+ 
+-            std::any anyData;
++            srcDispatch::Any anyData;
+             if(typeid(WhilePolicy) == typeid(*policy)) {
+                 anyData = policy->Data<WhileData>();
+             } else if(typeid(ForPolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/DeclPolicy.hpp b/src/policy_classes/DeclPolicy.hpp
+index 673c664..95a16ec 100644
+--- a/src/policy_classes/DeclPolicy.hpp
++++ b/src/policy_classes/DeclPolicy.hpp
+@@ -117,7 +117,7 @@ namespace srcDispatch {
+         ~DeclPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<DeclData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             using namespace srcDispatch;
+diff --git a/src/policy_classes/DeclStmtPolicy.hpp b/src/policy_classes/DeclStmtPolicy.hpp
+index 9ad9113..f899332 100644
+--- a/src/policy_classes/DeclStmtPolicy.hpp
++++ b/src/policy_classes/DeclStmtPolicy.hpp
+@@ -57,7 +57,7 @@ namespace srcDispatch {
+         ~DeclStmtPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<DeclStmtData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(DeclPolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/DeltaElement.tcc b/src/policy_classes/DeltaElement.tcc
+index 244a4fa..efadc44 100644
+--- a/src/policy_classes/DeltaElement.tcc
++++ b/src/policy_classes/DeltaElement.tcc
+@@ -318,8 +318,8 @@ void DeltaElement<type>::Append(srcDispatch::DiffOperation operation, const std:
+ 
+     if constexpr (!std::is_same_v<type, any_type>) {
+         static const any_type null_any_type;
+-        any_type* innerOriginal = original? std::any_cast<any_type>(&*original) : nullptr;
+-        any_type* innerModified = modified? std::any_cast<any_type>(&*modified) : nullptr;
++        any_type* innerOriginal = original? srcDispatch::any_cast<any_type>(&*original) : nullptr;
++        any_type* innerModified = modified? srcDispatch::any_cast<any_type>(&*modified) : nullptr;
+ 
+         if(operation == srcDispatch::COMMON) {
+             Value(*innerOriginal).value += str;
+@@ -368,11 +368,11 @@ std::string DeltaElement<type>::ToString(srcDispatch::DiffOperation operation) c
+ 
+         DeltaElement<any_type> innerElement(this->operation);
+         if(original) {
+-            innerElement.GetOriginal() = std::any_cast<any_type>(*original);
++            innerElement.GetOriginal() = srcDispatch::any_cast<any_type>(*original);
+         }
+ 
+         if(modified) {
+-            innerElement.GetModified() = std::any_cast<any_type>(*modified);
++            innerElement.GetModified() = srcDispatch::any_cast<any_type>(*modified);
+         }
+ 
+         return innerElement.ToString(operation);
+diff --git a/src/policy_classes/ExprTypePolicy.hpp b/src/policy_classes/ExprTypePolicy.hpp
+index 2dc6109..415f8da 100644
+--- a/src/policy_classes/ExprTypePolicy.hpp
++++ b/src/policy_classes/ExprTypePolicy.hpp
+@@ -45,7 +45,7 @@ namespace srcDispatch {
+         ~ExprTypePolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<ExprTypeData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(ExpressionPolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/ExpressionPolicy.cpp b/src/policy_classes/ExpressionPolicy.cpp
+index d40ec02..bcbbcb9 100644
+--- a/src/policy_classes/ExpressionPolicy.cpp
++++ b/src/policy_classes/ExpressionPolicy.cpp
+@@ -16,7 +16,7 @@ namespace srcDispatch {
+ 
+         std::string str = "";
+         bool outputSpace = false;
+-        for (const DeltaElement<std::any>& item : expr) {
++        for (const DeltaElement<srcDispatch::Any>& item : expr) {
+ 
+             bool outputRaw = item.IsOfOperation(operation);
+             if(outputRaw) {
+@@ -46,16 +46,16 @@ namespace srcDispatch {
+         data->startPosition = startPosition;
+         data->endPosition   = endPosition;
+ 
+-        for (const DeltaElement<std::any>& item : expr) {
+-            DeltaElement<std::any> exprAny;
++        for (const DeltaElement<srcDispatch::Any>& item : expr) {
++            DeltaElement<srcDispatch::Any> exprAny;
+             if(item.GetElement().type() == typeid(std::shared_ptr<NameData>)) {
+-                exprAny = DeltaElement<std::any>(operation, std::any_cast<std::shared_ptr<NameData>>(item)->copyAs(operation));
++                exprAny = DeltaElement<srcDispatch::Any>(operation, srcDispatch::any_cast<std::shared_ptr<NameData>>(item.GetElement())->copyAs(operation));
+             } else if(item.GetElement().type() == typeid(std::shared_ptr<OperatorData>)) {
+-                exprAny = DeltaElement<std::any>(operation, std::any_cast<std::shared_ptr<OperatorData>>(item)->copyAs(operation));
++                exprAny = DeltaElement<srcDispatch::Any>(operation, srcDispatch::any_cast<std::shared_ptr<OperatorData>>(item.GetElement())->copyAs(operation));
+             } else if(item.GetElement().type() == typeid(std::shared_ptr<LiteralData>)) {
+-                exprAny = DeltaElement<std::any>(operation, std::any_cast<std::shared_ptr<LiteralData>>(item)->copyAs(operation));
++                exprAny = DeltaElement<srcDispatch::Any>(operation, srcDispatch::any_cast<std::shared_ptr<LiteralData>>(item.GetElement())->copyAs(operation));
+             } else {
+-                exprAny = DeltaElement<std::any>(operation, std::any_cast<std::shared_ptr<CallData>>(item)->copyAs(operation));
++                exprAny = DeltaElement<srcDispatch::Any>(operation, srcDispatch::any_cast<std::shared_ptr<CallData>>(item.GetElement())->copyAs(operation));
+             }
+ 
+             data->expr.emplace_back(exprAny);
+@@ -68,13 +68,13 @@ namespace srcDispatch {
+ 
+     void ExpressionPolicy::Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) {
+         if(typeid(NamePolicy) == typeid(*policy)) {
+-            data.expr.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<NameData>()));
++            data.expr.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<NameData>()));
+         } else if(typeid(OperatorPolicy) == typeid(*policy)) {
+-            data.expr.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<OperatorData>()));
++            data.expr.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<OperatorData>()));
+         } else if(typeid(LiteralPolicy) == typeid(*policy)) {
+-            data.expr.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<LiteralData>()));
++            data.expr.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<LiteralData>()));
+         } else if(typeid(CallPolicy) == typeid(*policy)) {
+-            data.expr.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<CallData>()));
++            data.expr.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<CallData>()));
+         } else {
+             throw srcDispatch::PolicyError(std::string("Unhandled Policy '") + typeid(*policy).name() + '\'');
+         }
+diff --git a/src/policy_classes/ExpressionPolicy.hpp b/src/policy_classes/ExpressionPolicy.hpp
+index 25e5150..4aa1592 100644
+--- a/src/policy_classes/ExpressionPolicy.hpp
++++ b/src/policy_classes/ExpressionPolicy.hpp
+@@ -40,7 +40,7 @@ namespace srcDispatch {
+ 
+     struct ExpressionData : public ElementData {
+ 
+-        std::vector<DeltaElement<std::any>> expr;
++        std::vector<DeltaElement<srcDispatch::Any>> expr;
+ 
+         std::shared_ptr<ExpressionData> copyAs(srcDispatch::DiffOperation operation) const;
+ 
+@@ -72,7 +72,7 @@ namespace srcDispatch {
+         ~ExpressionPolicy();
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<ExpressionData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override;
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+diff --git a/src/policy_classes/ForPolicy.hpp b/src/policy_classes/ForPolicy.hpp
+index 97fdafd..f85a09a 100644
+--- a/src/policy_classes/ForPolicy.hpp
++++ b/src/policy_classes/ForPolicy.hpp
+@@ -62,7 +62,7 @@ namespace srcDispatch {
+         ~ForPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<ForData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(ControlPolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/FunctionPolicy.hpp b/src/policy_classes/FunctionPolicy.hpp
+index 6781177..0223e9f 100644
+--- a/src/policy_classes/FunctionPolicy.hpp
++++ b/src/policy_classes/FunctionPolicy.hpp
+@@ -155,7 +155,7 @@ namespace srcDispatch {
+         ~FunctionPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<FunctionData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(GenericPolicy) == typeid(*policy)) {
+@@ -194,9 +194,8 @@ namespace srcDispatch {
+                 data.language = ctx.currentFileLanguage;
+                 data.filename = ctx.currentFilePath;
+ 
+-                std::map<std::string, std::string>::const_iterator stereotype_attr_itr = ctx.attributes.find("stereotype");
+-                if(stereotype_attr_itr != ctx.attributes.end()) {
+-                    std::istringstream stereostring(stereotype_attr_itr->second);
++                if(const char* stereotype = ctx.GetAttribute("stereotype")) {
++                    std::istringstream stereostring(stereotype);
+                     data.stereotypes = std::set<std::string>(std::istream_iterator<std::string>(stereostring), std::istream_iterator<std::string>());
+                 }
+                 if(ctx.currentTag == "function" || ctx.currentTag == "function_decl") {
+diff --git a/src/policy_classes/GenericArgumentsPolicy.cpp b/src/policy_classes/GenericArgumentsPolicy.cpp
+index 516a8f9..ceed830 100644
+--- a/src/policy_classes/GenericArgumentsPolicy.cpp
++++ b/src/policy_classes/GenericArgumentsPolicy.cpp
+@@ -75,8 +75,8 @@ namespace srcDispatch {
+         ctx.dispatcher->RemoveListener(nullptr);
+     }
+ 
+-    std::any GenericArgumentsPolicy::DataInner() const {
+-        return std::make_shared<GenericArgumentsData>(data);
++    srcDispatch::Any GenericArgumentsPolicy::DataInner() const {
++        return HandOver(data);
+     }
+ 
+     void GenericArgumentsPolicy::InitializeGenericArgumentsPolicyHandlers() {
+diff --git a/src/policy_classes/GenericArgumentsPolicy.hpp b/src/policy_classes/GenericArgumentsPolicy.hpp
+index 1a2b8da..ee73c15 100644
+--- a/src/policy_classes/GenericArgumentsPolicy.hpp
++++ b/src/policy_classes/GenericArgumentsPolicy.hpp
+@@ -53,7 +53,7 @@ namespace srcDispatch {
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+     protected:
+-        virtual std::any DataInner() const override;
++        virtual srcDispatch::Any DataInner() const override;
+ 
+     private:
+         void InitializeGenericArgumentsPolicyHandlers();
+diff --git a/src/policy_classes/GenericPolicy.cpp b/src/policy_classes/GenericPolicy.cpp
+index a3b8794..18c10dd 100644
+--- a/src/policy_classes/GenericPolicy.cpp
++++ b/src/policy_classes/GenericPolicy.cpp
+@@ -63,8 +63,8 @@ namespace srcDispatch {
+         ctx.dispatcher->RemoveListener(nullptr);
+     }
+ 
+-    std::any GenericPolicy::DataInner() const {
+-        return std::make_shared<GenericData>(data);
++    srcDispatch::Any GenericPolicy::DataInner() const {
++        return HandOver(data);
+     }
+ 
+     void GenericPolicy::InitializeGenericPolicyHandlers() {
+diff --git a/src/policy_classes/GenericPolicy.hpp b/src/policy_classes/GenericPolicy.hpp
+index fdda548..8b2a6b1 100644
+--- a/src/policy_classes/GenericPolicy.hpp
++++ b/src/policy_classes/GenericPolicy.hpp
+@@ -52,7 +52,7 @@ namespace srcDispatch {
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+     protected:
+-        virtual std::any DataInner() const override;
++        virtual srcDispatch::Any DataInner() const override;
+ 
+     private:
+         void InitializeGenericPolicyHandlers();
+diff --git a/src/policy_classes/GotoPolicy.hpp b/src/policy_classes/GotoPolicy.hpp
+index 9b0d476..b0364e2 100644
+--- a/src/policy_classes/GotoPolicy.hpp
++++ b/src/policy_classes/GotoPolicy.hpp
+@@ -51,7 +51,7 @@ namespace srcDispatch {
+         ~GotoPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<GotoData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(NamePolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/IfStmtPolicy.hpp b/src/policy_classes/IfStmtPolicy.hpp
+index 785d832..571d955 100644
+--- a/src/policy_classes/IfStmtPolicy.hpp
++++ b/src/policy_classes/IfStmtPolicy.hpp
+@@ -26,7 +26,7 @@ namespace srcDispatch {
+ 
+     struct IfStmtData : public ElementData {
+ 
+-        std::vector<DeltaElement<std::any>> clauses;
++        std::vector<DeltaElement<srcDispatch::Any>> clauses;
+ 
+         template<class type>
+         friend class DeltaElement;
+@@ -62,15 +62,15 @@ namespace srcDispatch {
+         ~IfStmtPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<IfStmtData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(IfPolicy) == typeid(*policy)) {
+-                data.clauses.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<IfData>()));
++                data.clauses.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<IfData>()));
+             } else if(typeid(ElseIfPolicy) == typeid(*policy)) {
+-                data.clauses.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<ElseIfData>()));
++                data.clauses.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<ElseIfData>()));
+             } else if(typeid(ElsePolicy) == typeid(*policy)) {
+-                data.clauses.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<ElseData>()));
++                data.clauses.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<ElseData>()));
+             } else {
+                 throw srcDispatch::PolicyError(std::string("Unhandled Policy '") + typeid(*policy).name() + '\'');
+             }
+diff --git a/src/policy_classes/IncludePolicy.hpp b/src/policy_classes/IncludePolicy.hpp
+index 899486a..4048abe 100644
+--- a/src/policy_classes/IncludePolicy.hpp
++++ b/src/policy_classes/IncludePolicy.hpp
+@@ -65,7 +65,7 @@ namespace srcDispatch {
+         ~IncludePolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<IncludeData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+         void Notify(const PolicyDispatcher* policy [[maybe_unused]], const srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+diff --git a/src/policy_classes/IncrPolicy.hpp b/src/policy_classes/IncrPolicy.hpp
+index f688097..15d51e6 100644
+--- a/src/policy_classes/IncrPolicy.hpp
++++ b/src/policy_classes/IncrPolicy.hpp
+@@ -74,7 +74,7 @@ namespace srcDispatch {
+         ~IncrPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<IncrData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(ExpressionPolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/InitPolicy.hpp b/src/policy_classes/InitPolicy.hpp
+index 6e463d0..a02389e 100644
+--- a/src/policy_classes/InitPolicy.hpp
++++ b/src/policy_classes/InitPolicy.hpp
+@@ -28,7 +28,7 @@ namespace srcDispatch {
+ 
+     struct InitData : public ElementData {
+ 
+-        std::vector<DeltaElement<std::any>> inits;
++        std::vector<DeltaElement<srcDispatch::Any>> inits;
+ 
+         template<class type>
+         friend class DeltaElement;
+@@ -38,7 +38,7 @@ namespace srcDispatch {
+ 
+             std::string str;
+             bool printComma = false;
+-            for (const DeltaElement<std::any>& init : inits) {
++            for (const DeltaElement<srcDispatch::Any>& init : inits) {
+ 
+                 bool outputRaw = init.IsOfOperation(operation);
+                 if(outputRaw) {
+@@ -79,7 +79,7 @@ namespace srcDispatch {
+         ~InitPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<InitData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(ExpressionPolicy) == typeid(*policy)) {
+@@ -93,9 +93,9 @@ namespace srcDispatch {
+                 srcDispatch::DiffOperation operation = ctx.diffStack.back().operation;
+                 std::shared_ptr<DeclData> decl = policy->Data<DeclData>();
+                 if(data.inits.size() && data.inits.back().GetElement().type() == typeid(std::shared_ptr<DeclData>)) {
+-                    DeltaElement<std::shared_ptr<TypeData>> typeData(operation, std::any_cast<std::shared_ptr<DeclData>>(data.inits.back().GetElement())->type.GetElement()->copyAs(operation));
++                    DeltaElement<std::shared_ptr<TypeData>> typeData(operation, srcDispatch::any_cast<std::shared_ptr<DeclData>>(data.inits.back().GetElement())->type.GetElement()->copyAs(operation));
+                     decl->type     = typeData;
+-                    decl->isStatic = std::any_cast<std::shared_ptr<DeclData>>(data.inits.back().GetElement())->isStatic;
++                    decl->isStatic = srcDispatch::any_cast<std::shared_ptr<DeclData>>(data.inits.back().GetElement())->isStatic;
+                 }
+                 data.inits.emplace_back(operation, decl);
+             } else {
+diff --git a/src/policy_classes/LabelPolicy.hpp b/src/policy_classes/LabelPolicy.hpp
+index 514331e..fe8016b 100644
+--- a/src/policy_classes/LabelPolicy.hpp
++++ b/src/policy_classes/LabelPolicy.hpp
+@@ -56,7 +56,7 @@ namespace srcDispatch {
+         ~LabelPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<LabelData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(NamePolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/LiteralPolicy.hpp b/src/policy_classes/LiteralPolicy.hpp
+index 7b7c6ab..c88d395 100644
+--- a/src/policy_classes/LiteralPolicy.hpp
++++ b/src/policy_classes/LiteralPolicy.hpp
+@@ -57,7 +57,7 @@ namespace srcDispatch {
+         ~LiteralPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<LiteralData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+         void Notify(const PolicyDispatcher* policy [[maybe_unused]], const srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+diff --git a/src/policy_classes/NamePolicy.cpp b/src/policy_classes/NamePolicy.cpp
+index 310dcbb..bcab2d9 100644
+--- a/src/policy_classes/NamePolicy.cpp
++++ b/src/policy_classes/NamePolicy.cpp
+@@ -27,7 +27,7 @@ namespace srcDispatch {
+     std::string NameData::ToString(srcDispatch::DiffOperation operation) const {
+ 
+         std::string str = name.ToString(operation);
+-        for (const DeltaElement<std::any>& name_element : names) {
++        for (const DeltaElement<srcDispatch::Any>& name_element : names) {
+             if(name_element.GetElement().type() == typeid(std::shared_ptr<NameData>)) {
+                 str += name_element.ToString<std::shared_ptr<NameData>>(operation);
+             } else {
+@@ -64,12 +64,12 @@ namespace srcDispatch {
+             data->name = DeltaElement<std::string>(operation, name.GetElement());
+         }
+ 
+-        for (const DeltaElement<std::any>& name_element : names) {
+-            DeltaElement<std::any> nameAny;
++        for (const DeltaElement<srcDispatch::Any>& name_element : names) {
++            DeltaElement<srcDispatch::Any> nameAny;
+             if(name_element.GetElement().type() == typeid(std::shared_ptr<NameData>)) {
+-                nameAny = DeltaElement<std::any>(operation, std::any_cast<std::shared_ptr<NameData>>(name_element)->copyAs(operation));
++                nameAny = DeltaElement<srcDispatch::Any>(operation, srcDispatch::any_cast<std::shared_ptr<NameData>>(name_element.GetElement())->copyAs(operation));
+             } else {
+-                nameAny = DeltaElement<std::any>(operation, std::any_cast<std::shared_ptr<OperatorData>>(name_element)->copyAs(operation));
++                nameAny = DeltaElement<srcDispatch::Any>(operation, srcDispatch::any_cast<std::shared_ptr<OperatorData>>(name_element.GetElement())->copyAs(operation));
+             }
+             data->names.emplace_back(nameAny);
+         }
+@@ -90,9 +90,9 @@ namespace srcDispatch {
+     void NamePolicy::Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) {
+ 
+         if(typeid(NamePolicy) == typeid(*policy)) {
+-            data.names.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<NameData>()));
++            data.names.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<NameData>()));
+         } else if(typeid(OperatorPolicy) == typeid(*policy)) {
+-            data.names.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<OperatorData>()));
++            data.names.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<OperatorData>()));
+         } else if(typeid(GenericArgumentsPolicy) == typeid(*policy)) {
+             data.templateArgumentList = DeltaElement(ctx.diffStack.back().operation, policy->Data<GenericArgumentsData>());
+         } else if(typeid(ExpressionPolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/NamePolicy.hpp b/src/policy_classes/NamePolicy.hpp
+index e4f044b..18dd081 100644
+--- a/src/policy_classes/NamePolicy.hpp
++++ b/src/policy_classes/NamePolicy.hpp
+@@ -33,7 +33,7 @@ namespace srcDispatch {
+     struct NameData : public ElementData {
+ 
+         DeltaElement<std::string> name;
+-        std::vector<DeltaElement<std::any>> names;
++        std::vector<DeltaElement<srcDispatch::Any>> names;
+         DeltaElement<std::shared_ptr<GenericArgumentsData>> templateArgumentList;
+         std::vector<DeltaElement<std::shared_ptr<ExpressionData>>> indices;
+ 
+@@ -68,7 +68,7 @@ namespace srcDispatch {
+         ~NamePolicy();
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<NameData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override;
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+diff --git a/src/policy_classes/OperatorPolicy.hpp b/src/policy_classes/OperatorPolicy.hpp
+index d45f18a..7bfde6b 100644
+--- a/src/policy_classes/OperatorPolicy.hpp
++++ b/src/policy_classes/OperatorPolicy.hpp
+@@ -57,7 +57,7 @@ namespace srcDispatch {
+         ~OperatorPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<OperatorData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+         void Notify(const PolicyDispatcher* policy [[maybe_unused]], const srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+diff --git a/src/policy_classes/Position.cpp b/src/policy_classes/Position.cpp
+index c448cd0..b8159b2 100644
+--- a/src/policy_classes/Position.cpp
++++ b/src/policy_classes/Position.cpp
+@@ -26,6 +26,34 @@ Position::Position(const std::string& posStr) : Position() {
+ 
+ }
+ 
++// "line:column" made of digits only is parsed in place (perf: the two substr + two stoi per
++// position were 2.6 % of a run); anything else, including empty text, signs, spaces, trailing
++// text or more than nine digits, takes the std::string constructor so the behaviour (and its
++// exceptions) is unchanged.
++Position::Position(const char* posStr) : Position() {
++
++   const char* p = posStr;
++   std::size_t lineValue = 0, columnValue = 0;
++   int digits = 0;
++
++   if(p != nullptr) {
++      for(; *p >= '0' && *p <= '9' && digits < 10; ++p, ++digits) lineValue = lineValue * 10 + (*p - '0');
++      if(digits > 0 && digits < 10 && *p == ':') {
++         ++p;
++         digits = 0;
++         for(; *p >= '0' && *p <= '9' && digits < 10; ++p, ++digits) columnValue = columnValue * 10 + (*p - '0');
++         if(digits > 0 && digits < 10 && *p == '\0') {
++            line = lineValue;
++            column = columnValue;
++            return;
++         }
++      }
++   }
++
++   *this = Position(std::string(posStr ? posStr : ""));
++
++}
++
+ std::size_t Position::GetLine() const {
+    return line;
+ }
+diff --git a/src/policy_classes/Position.hpp b/src/policy_classes/Position.hpp
+index ada8717..e0a02d7 100644
+--- a/src/policy_classes/Position.hpp
++++ b/src/policy_classes/Position.hpp
+@@ -18,6 +18,7 @@ class Position {
+ public:
+     Position();
+     Position(const std::string& posStr);
++    Position(const char* posStr);
+ 
+     std::size_t GetLine() const;
+     std::size_t GetColumn() const;
+diff --git a/src/policy_classes/TryPolicy.hpp b/src/policy_classes/TryPolicy.hpp
+index eba5474..cb59916 100644
+--- a/src/policy_classes/TryPolicy.hpp
++++ b/src/policy_classes/TryPolicy.hpp
+@@ -29,7 +29,7 @@ namespace srcDispatch {
+     struct TryData : public ElementData {
+ 
+         DeltaElement<std::shared_ptr<BlockData>> block;
+-        std::vector<DeltaElement<std::any>>     clauses;
++        std::vector<DeltaElement<srcDispatch::Any>>     clauses;
+     };
+ 
+     class TryPolicy :
+@@ -52,13 +52,13 @@ namespace srcDispatch {
+         ~TryPolicy() {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<TryData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+         void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override {
+             if(typeid(BlockPolicy) == typeid(*policy)) {
+                 data.block.Update(ctx.diffStack.back().operation, policy->Data<BlockData>());
+             } else if(typeid(CatchPolicy) == typeid(*policy)) {
+-                data.clauses.push_back(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<CatchData>()));
++                data.clauses.push_back(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<CatchData>()));
+             } else {
+                 throw srcDispatch::PolicyError(std::string("Unhandled Policy '") + typeid(*policy).name() + '\'');
+             }
+diff --git a/src/policy_classes/TypePolicy.cpp b/src/policy_classes/TypePolicy.cpp
+index 77849cc..434e064 100644
+--- a/src/policy_classes/TypePolicy.cpp
++++ b/src/policy_classes/TypePolicy.cpp
+@@ -20,7 +20,7 @@ namespace srcDispatch {
+     std::string TypeData::ToString(srcDispatch::DiffOperation operation) const {
+         std::string str;
+         bool printSpace = false;
+-        for (const std::pair<DeltaElement<std::any>, DeltaElement<TypeData::TypeType>>& type : types) {
++        for (const std::pair<DeltaElement<srcDispatch::Any>, DeltaElement<TypeData::TypeType>>& type : types) {
+ 
+             bool outputRaw = type.second.IsOfOperation(operation);
+             if(outputRaw) {
+@@ -54,15 +54,15 @@ namespace srcDispatch {
+         data->startPosition = startPosition;
+         data->endPosition   = endPosition;
+ 
+-        for(const std::pair<DeltaElement<std::any>, DeltaElement<TypeType>>& type : types) {
+-            DeltaElement<std::any> typeAny;
++        for(const std::pair<DeltaElement<srcDispatch::Any>, DeltaElement<TypeType>>& type : types) {
++            DeltaElement<srcDispatch::Any> typeAny;
+             if(type.second.GetElement() == TypeData::SPECIFIER) {
+-                typeAny = DeltaElement<std::any>(operation, std::any_cast<std::shared_ptr<std::string>>(type.first));
++                typeAny = DeltaElement<srcDispatch::Any>(operation, srcDispatch::any_cast<std::shared_ptr<std::string>>(type.first.GetElement()));
+             } else if(type.second.GetElement() == TypeData::TYPENAME) {
+-                typeAny = DeltaElement<std::any>(operation, std::any_cast<std::shared_ptr<NameData>>(type.first.GetElement())->copyAs(operation));
++                typeAny = DeltaElement<srcDispatch::Any>(operation, srcDispatch::any_cast<std::shared_ptr<NameData>>(type.first.GetElement())->copyAs(operation));
+             } else if(type.second.GetElement() == TypeData::CLASS) {
+                 std::cerr << "IMPLEMENT CLASS copyAs()\n";
+-                // typeAny = DeltaElement<std::any>(operation, std::any_cast<std::shared_ptr<ClassData>>(type.first.GetElement())->copyAs(operation));
++                // typeAny = DeltaElement<srcDispatch::Any>(operation, srcDispatch::any_cast<std::shared_ptr<ClassData>>(type.first.GetElement())->copyAs(operation));
+             }
+             data->types.emplace_back(typeAny, DeltaElement(operation, type.second.GetElement()));
+         }
+@@ -79,17 +79,17 @@ namespace srcDispatch {
+ 
+     void TypePolicy::Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) {
+         if(typeid(NamePolicy) == typeid(*policy)) {
+-            data.types.push_back(std::make_pair(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<NameData>()), DeltaElement(ctx.diffStack.back().operation, TypeData::TYPENAME)));
++            data.types.push_back(std::make_pair(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<NameData>()), DeltaElement(ctx.diffStack.back().operation, TypeData::TYPENAME)));
+         } else if(typeid(ClassPolicy) == typeid(*policy)) {
+-            data.types.push_back(std::make_pair(DeltaElement<std::any>(ctx.diffStack.back().operation, policy->Data<ClassData>()), DeltaElement(ctx.diffStack.back().operation, TypeData::CLASS)));
++            data.types.push_back(std::make_pair(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, policy->Data<ClassData>()), DeltaElement(ctx.diffStack.back().operation, TypeData::CLASS)));
+         } else {
+             throw srcDispatch::PolicyError(std::string("Unhandled Policy '") + typeid(*policy).name() + '\'');
+         }
+         ctx.dispatcher->RemoveListenerDispatch(nullptr);
+     }
+ 
+-    std::any TypePolicy::DataInner() const {
+-        return std::make_shared<TypeData>(data);
++    srcDispatch::Any TypePolicy::DataInner() const {
++        return HandOver(data);
+     }
+ 
+     void TypePolicy::InitializeTypePolicyHandlers() {
+@@ -153,7 +153,7 @@ namespace srcDispatch {
+         {
+             if(!depth) return;
+ 
+-            data.types.push_back(std::make_pair(DeltaElement<std::any>(), DeltaElement(ctx.diffStack.back().operation, TypeData::NONE)));
++            data.types.push_back(std::make_pair(DeltaElement<srcDispatch::Any>(), DeltaElement(ctx.diffStack.back().operation, TypeData::NONE)));
+             closeEventMap[ParserState::tokenstring] = [this](srcSAXEventContext& ctx) {
+                 TypeData::TypeType modifier = TypeData::NONE;
+                 if(ctx.currentToken == "*") {
+@@ -180,7 +180,7 @@ namespace srcDispatch {
+         openEventMap[ParserState::specifier] = [this](srcSAXEventContext& ctx) {
+             if(!depth) return;
+ 
+-            data.types.push_back(std::make_pair(DeltaElement<std::any>(ctx.diffStack.back().operation, std::make_shared<std::string>("")), DeltaElement(ctx.diffStack.back().operation, TypeData::SPECIFIER)));
++            data.types.push_back(std::make_pair(DeltaElement<srcDispatch::Any>(ctx.diffStack.back().operation, std::make_shared<std::string>("")), DeltaElement(ctx.diffStack.back().operation, TypeData::SPECIFIER)));
+             closeEventMap[ParserState::tokenstring] = [this](srcSAXEventContext& ctx) {
+                 data.types.back().first.Append<std::shared_ptr<std::string>>(ctx.diffStack.back().operation, ctx.currentToken);
+             };
+diff --git a/src/policy_classes/TypePolicy.hpp b/src/policy_classes/TypePolicy.hpp
+index bc0a9ec..91ca187 100644
+--- a/src/policy_classes/TypePolicy.hpp
++++ b/src/policy_classes/TypePolicy.hpp
+@@ -27,7 +27,7 @@ namespace srcDispatch {
+     struct TypeData : public ElementData {
+         enum TypeType : int { TYPENAME, POINTER, REFERENCE, RVALUE, SPECIFIER, CLASS, NONE };
+ 
+-        std::vector<std::pair<DeltaElement<std::any>, DeltaElement<TypeType>>> types;
++        std::vector<std::pair<DeltaElement<srcDispatch::Any>, DeltaElement<TypeType>>> types;
+ 
+         std::shared_ptr<TypeData> copyAs(srcDispatch::DiffOperation operation) const;
+ 
+@@ -55,7 +55,7 @@ namespace srcDispatch {
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+     protected:
+-        virtual std::any DataInner() const override;
++        virtual srcDispatch::Any DataInner() const override;
+ 
+     private:
+         void InitializeTypePolicyHandlers();
+diff --git a/src/policy_classes/TypedefPolicy.cpp b/src/policy_classes/TypedefPolicy.cpp
+index 5d7f42d..7ce83f7 100644
+--- a/src/policy_classes/TypedefPolicy.cpp
++++ b/src/policy_classes/TypedefPolicy.cpp
+@@ -20,7 +20,7 @@ TypedefPolicy::TypedefPolicy(std::initializer_list<srcDispatch::PolicyListener *
+ 
+ TypedefPolicy::~TypedefPolicy() {}
+ 
+-std::any TypedefPolicy::DataInner() const { return std::make_shared<TypedefData>(data); }
++srcDispatch::Any TypedefPolicy::DataInner() const { return HandOver(data); }
+ 
+ void TypedefPolicy::Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) {
+     if(typeid(TypePolicy) == typeid(*policy)) {
+diff --git a/src/policy_classes/TypedefPolicy.hpp b/src/policy_classes/TypedefPolicy.hpp
+index 16ad981..34a94f2 100644
+--- a/src/policy_classes/TypedefPolicy.hpp
++++ b/src/policy_classes/TypedefPolicy.hpp
+@@ -74,7 +74,7 @@ namespace srcDispatch {
+         ~TypedefPolicy();
+ 
+     protected:
+-        std::any DataInner() const override;
++        srcDispatch::Any DataInner() const override;
+ 
+         virtual void Notify(const PolicyDispatcher* policy, const srcDispatch::srcSAXEventContext& ctx) override;
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override;
+diff --git a/src/policy_classes/UnitPolicy.hpp b/src/policy_classes/UnitPolicy.hpp
+index 54112fa..e2381bc 100644
+--- a/src/policy_classes/UnitPolicy.hpp
++++ b/src/policy_classes/UnitPolicy.hpp
+@@ -70,7 +70,7 @@ namespace srcDispatch {
+         void NotifyWrite(const PolicyDispatcher* policy [[maybe_unused]], srcDispatch::srcSAXEventContext& ctx [[maybe_unused]]) override {}
+ 
+     protected:
+-        std::any DataInner() const override { return std::make_shared<UnitData>(data); }
++        srcDispatch::Any DataInner() const override { return HandOver(data); }
+ 
+     private:
+         void InitializeUnitPolicyHandlers();
+diff --git a/srcSAX b/srcSAX
+--- a/srcSAX
++++ b/srcSAX
+@@ -1 +1 @@
+-Subproject commit 93cbbee89957ea1dc8c744c72b7a835016ad0fd3
++Subproject commit 93cbbee89957ea1dc8c744c72b7a835016ad0fd3-dirty
+diff --git a/src/dispatcher/Any.hpp b/src/dispatcher/Any.hpp
+new file mode 100644
+index 0000000..d9459c6
+--- /dev/null
++++ b/src/dispatcher/Any.hpp
+@@ -0,0 +1,201 @@
++/**
++ * @file Any.hpp
++ *
++ * @copyright Copyright (C) 2013-2014 SDML (www.srcML.org)
++ *
++ * The srcML Toolkit is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * The srcML Toolkit is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with the srcML Toolkit; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ */
++
++#ifndef INCLUDED_SRCDISPATCH_ANY_HPP
++#define INCLUDED_SRCDISPATCH_ANY_HPP
++
++#include <cstddef>
++#include <new>
++#include <type_traits>
++#include <typeinfo>
++#include <utility>
++
++namespace srcDispatch {
++
++    class bad_any_cast : public std::bad_cast {
++    public:
++        const char* what() const noexcept override { return "bad srcDispatch::any_cast"; }
++    };
++
++    // The srcDispatch::Any of the object model, with room in place for what it holds (perf plan M7,
++    // first part). Every child link of the model is a shared_ptr to a data struct held in a
++    // srcDispatch::Any; srcDispatch::Any keeps anything larger than one pointer on the heap, so each link
++    // cost a heap block of its own next to the control block the shared_ptr already has.
++    // This one stores values of up to two pointers in place (a shared_ptr is exactly that)
++    // and falls back to the heap for anything larger. Same operations as the srcDispatch::Any the
++    // code used: construction and assignment from any value, copy, move, type(),
++    // has_value(), reset(), and any_cast by value or by pointer.
++    class Any {
++    public:
++        Any() noexcept = default;
++        Any(const Any& other) { if(other.manager) other.manager(Op::Copy, &other, this); }
++        Any(Any&& other) noexcept {
++            if(other.manager) {
++                other.manager(Op::Move, &other, this);
++                other.manager = nullptr;
++            }
++        }
++        template<class T, class D = std::decay_t<T>,
++                 std::enable_if_t<!std::is_same_v<D, Any>, int> = 0>
++        Any(T&& value) { Construct<D>(std::forward<T>(value)); }
++        ~Any() { reset(); }
++
++        Any& operator=(const Any& other) {
++            if(this != &other) {
++                Any copy(other);
++                swap(copy);
++            }
++            return *this;
++        }
++        Any& operator=(Any&& other) noexcept {
++            if(this != &other) {
++                reset();
++                if(other.manager) {
++                    other.manager(Op::Move, &other, this);
++                    other.manager = nullptr;
++                }
++            }
++            return *this;
++        }
++        template<class T, class D = std::decay_t<T>,
++                 std::enable_if_t<!std::is_same_v<D, Any>, int> = 0>
++        Any& operator=(T&& value) {
++            Any fresh(std::forward<T>(value));
++            swap(fresh);
++            return *this;
++        }
++
++        void reset() noexcept {
++            if(manager) {
++                manager(Op::Destroy, this, nullptr);
++                manager = nullptr;
++            }
++        }
++        bool has_value() const noexcept { return manager != nullptr; }
++        const std::type_info& type() const noexcept {
++            if(!manager) return typeid(void);
++            const std::type_info* info = nullptr;
++            manager(Op::Type, this, &info);
++            return *info;
++        }
++        void swap(Any& other) noexcept {
++            Any tmp(std::move(other));
++            other = std::move(*this);
++            *this = std::move(tmp);
++        }
++
++    private:
++        enum class Op { Copy, Move, Destroy, Type, Get };
++
++        static constexpr std::size_t StorageSize = 2 * sizeof(void*);
++        template<class T>
++        static constexpr bool Inline = sizeof(T) <= StorageSize && alignof(T) <= alignof(void*)
++                                       && std::is_nothrow_move_constructible_v<T>;
++
++        alignas(void*) unsigned char storage[StorageSize];
++        void (*manager)(Op, const Any*, void*) = nullptr;
++
++        template<class T>
++        T* Slot() { return Inline<T> ? reinterpret_cast<T*>(storage) : *reinterpret_cast<T**>(storage); }
++        template<class T>
++        const T* Slot() const { return Inline<T> ? reinterpret_cast<const T*>(storage) : *reinterpret_cast<T* const*>(storage); }
++
++        template<class T, class... Args>
++        void Construct(Args&&... args) {
++            if constexpr(Inline<T>) {
++                ::new (static_cast<void*>(storage)) T(std::forward<Args>(args)...);
++            } else {
++                *reinterpret_cast<T**>(storage) = new T(std::forward<Args>(args)...);
++            }
++            manager = &Manage<T>;
++        }
++
++        template<class T>
++        static void Manage(Op op, const Any* self, void* arg) {
++            switch(op) {
++                case Op::Copy:
++                    static_cast<Any*>(arg)->Construct<T>(*self->Slot<T>());
++                    break;
++                case Op::Move:
++                    if constexpr(Inline<T>) {
++                        static_cast<Any*>(arg)->Construct<T>(std::move(*const_cast<Any*>(self)->Slot<T>()));
++                        const_cast<Any*>(self)->Slot<T>()->~T();
++                    } else {
++                        // the heap object changes hands
++                        *reinterpret_cast<T**>(static_cast<Any*>(arg)->storage) = const_cast<Any*>(self)->Slot<T>();
++                        static_cast<Any*>(arg)->manager = &Manage<T>;
++                    }
++                    break;
++                case Op::Destroy:
++                    if constexpr(Inline<T>) {
++                        const_cast<Any*>(self)->Slot<T>()->~T();
++                    } else {
++                        delete const_cast<Any*>(self)->Slot<T>();
++                    }
++                    break;
++                case Op::Type:
++                    *static_cast<const std::type_info**>(arg) = &typeid(T);
++                    break;
++                case Op::Get:
++                    *static_cast<void**>(arg) = const_cast<T*>(self->Slot<T>());
++                    break;
++            }
++        }
++
++        template<class T> friend T* any_cast(Any* any) noexcept;
++        template<class T> friend const T* any_cast(const Any* any) noexcept;
++    };
++
++    template<class T>
++    T* any_cast(Any* any) noexcept {
++        if(!any || !any->manager || any->type() != typeid(T)) return nullptr;
++        void* p = nullptr;
++        any->manager(Any::Op::Get, any, &p);
++        return static_cast<T*>(p);
++    }
++    template<class T>
++    const T* any_cast(const Any* any) noexcept {
++        return any_cast<T>(const_cast<Any*>(any));
++    }
++    template<class T>
++    T any_cast(const Any& any) {
++        using U = std::remove_cv_t<std::remove_reference_t<T>>;
++        const U* p = any_cast<U>(&any);
++        if(!p) throw bad_any_cast();
++        return static_cast<T>(*p);
++    }
++    template<class T>
++    T any_cast(Any& any) {
++        using U = std::remove_cv_t<std::remove_reference_t<T>>;
++        U* p = any_cast<U>(&any);
++        if(!p) throw bad_any_cast();
++        return static_cast<T>(*p);
++    }
++    template<class T>
++    T any_cast(Any&& any) {
++        using U = std::remove_cv_t<std::remove_reference_t<T>>;
++        U* p = any_cast<U>(&any);
++        if(!p) throw bad_any_cast();
++        return static_cast<T>(std::move(*p));
++    }
++
++}
++
++#endif
