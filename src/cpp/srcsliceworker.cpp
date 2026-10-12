@@ -156,7 +156,7 @@ bool SrcSliceOperations::IsPointerDereferenced(std::shared_ptr<srcDispatch::Name
                 return false;
             }
         } else {
-            opStr = std::any_cast<std::shared_ptr<srcDispatch::OperatorData>>(deltaNameElem.GetElement())->op;
+            opStr = srcDispatch::any_cast<std::shared_ptr<srcDispatch::OperatorData>>(deltaNameElem.GetElement())->op;
         }
     }
     return false;
@@ -213,7 +213,7 @@ std::string SrcSliceOperations::GetTypeDetails(const DeclInfo& localVar, bool& i
         } else if (typeEntry.second.GetElement() == srcDispatch::TypeData::SPECIFIER) {
             // check for certain specifiers such as: auto, ref, ...
             if (typeEntry.first.GetElement().type() == typeid(std::shared_ptr<std::string>)) {
-                auto specifier = std::any_cast<std::shared_ptr<std::string>>(typeEntry.first.GetElement());
+                auto specifier = srcDispatch::any_cast<std::shared_ptr<std::string>>(typeEntry.first.GetElement());
                 
                 bool usefulSpecifer = (
                     *specifier == "auto" || *specifier == "ref"
@@ -256,7 +256,7 @@ void SrcSliceOperations::ProcessDecls(Blob& data, const SliceCtx& sctx, DeclStmt
 
             if (sctx.currentFileLanguage == "C" || sctx.currentFileLanguage == "C++") {
                 typedef std::vector<
-                    std::pair<srcDispatch::DeltaElement<std::any>,
+                    std::pair<srcDispatch::DeltaElement<srcDispatch::Any>,
                     srcDispatch::DeltaElement<srcDispatch::TypeData::TypeType>>
                 > TypeVector;
 
@@ -267,7 +267,7 @@ void SrcSliceOperations::ProcessDecls(Blob& data, const SliceCtx& sctx, DeclStmt
                         if (ty.second.GetElement() != srcDispatch::TypeData::SPECIFIER) continue;
                         if (ty.first.GetElement().type() != typeid(std::shared_ptr<std::string>)) continue;
 
-                        auto specifier = std::any_cast<std::shared_ptr<std::string>>(ty.first.GetElement());
+                        auto specifier = srcDispatch::any_cast<std::shared_ptr<std::string>>(ty.first.GetElement());
                         if (!specifier) continue;
                         if(*specifier != "extern") continue;
                         return true;
@@ -575,7 +575,7 @@ void SrcSliceOperations::ProcessStmts(Blob& data, const SliceCtx& sctx, const Fu
     // Capture Conditional expressions
     for (auto& stmt : block->statements) {
         if (stmt.GetElement().type() == typeid(std::shared_ptr<srcDispatch::ExprStmtData>)) {
-            auto exprstmt = std::any_cast<std::shared_ptr<srcDispatch::ExprStmtData>>(stmt.GetElement());
+            auto exprstmt = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ExprStmtData>>(stmt.GetElement());
             if (!exprstmt) continue;
             if (!exprstmt->expr) continue;
 
@@ -583,7 +583,7 @@ void SrcSliceOperations::ProcessStmts(Blob& data, const SliceCtx& sctx, const Fu
             ProcessExprStmt(data, sctx, exprstmt->expr, funcData, className);
         } else if (stmt.GetElement().type() == typeid(std::shared_ptr<srcDispatch::DeclStmtData>)) {
             // local decls
-            auto declStmtData = std::any_cast<std::shared_ptr<srcDispatch::DeclStmtData>>(stmt.GetElement());
+            auto declStmtData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::DeclStmtData>>(stmt.GetElement());
             if (!declStmtData) continue;
 
             for (auto& deltaDecl : declStmtData->decls) {
@@ -598,7 +598,7 @@ void SrcSliceOperations::ProcessStmts(Blob& data, const SliceCtx& sctx, const Fu
                 CreateSliceProfile(data, sctx, deltaDecl, funcData, className, endOfScope);
             }
         } else if (stmt.GetElement().type() == typeid(std::shared_ptr<srcDispatch::ReturnData>)) {
-            auto retstmt = std::any_cast<std::shared_ptr<srcDispatch::ReturnData>>(stmt.GetElement());
+            auto retstmt = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ReturnData>>(stmt.GetElement());
             if (!retstmt) continue;
             if (!retstmt->expr) continue;
 
@@ -618,7 +618,7 @@ void SrcSliceOperations::ProcessStmts(Blob& data, const SliceCtx& sctx, const Fu
             CollectConditionalData(data, sctx, funcData, stmt.GetElement(), className);
         } else if (stmt.GetElement().type() == typeid(std::shared_ptr<srcDispatch::TryData>)) {
             // For Java we have try-with-resources, make slice profiles of the resources
-            auto tryData = std::any_cast<std::shared_ptr<srcDispatch::TryData>>(stmt.GetElement());
+            auto tryData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::TryData>>(stmt.GetElement());
 
             if (!tryData) continue;
 
@@ -626,7 +626,7 @@ void SrcSliceOperations::ProcessStmts(Blob& data, const SliceCtx& sctx, const Fu
             for (auto& clause : tryData->clauses) {
                 if (clause.GetElement().type() != typeid(std::shared_ptr<srcDispatch::CatchData>)) continue;
 
-                auto catchData = std::any_cast<std::shared_ptr<srcDispatch::CatchData>>(clause.GetElement());
+                auto catchData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::CatchData>>(clause.GetElement());
                 if (!catchData) continue;
 
                 for (auto& parameter : catchData->parameters) {
@@ -645,7 +645,7 @@ void SrcSliceOperations::ProcessStmts(Blob& data, const SliceCtx& sctx, const Fu
             // capture expressions
             CollectTryBlockData(data, sctx, funcData, tryData, className);
         } else if (stmt.GetElement().type() == typeid(std::shared_ptr<srcDispatch::ThrowData>)) {
-            auto throwData = std::any_cast<std::shared_ptr<srcDispatch::ThrowData>>(stmt.GetElement());
+            auto throwData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ThrowData>>(stmt.GetElement());
 
             if (!throwData) continue;
             if (!throwData->expr) continue;
@@ -732,7 +732,7 @@ void SrcSliceOperations::CollectTryBlockData(Blob& data, const SliceCtx& sctx, c
     // Collect Decls and Exprs within the catch block
     for (auto& clause : tryBlock->clauses) {
         if (clause.GetElement().type() == typeid(std::shared_ptr<srcDispatch::CatchData>)) {
-            auto catchData = std::any_cast<std::shared_ptr<srcDispatch::CatchData>>(clause.GetElement());
+            auto catchData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::CatchData>>(clause.GetElement());
             if (catchData->block) {
                 ProcessStmts(data, sctx, funcData, catchData->block, className);
             }
@@ -740,11 +740,11 @@ void SrcSliceOperations::CollectTryBlockData(Blob& data, const SliceCtx& sctx, c
     }
 }
 
-void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx, const FunctionInfo& funcData, std::any& cntl, const std::string& className) {
+void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx, const FunctionInfo& funcData, srcDispatch::Any& cntl, const std::string& className) {
     // identify what conditional type we are viewing and handle logic accordingly
     if (cntl.type() == typeid(std::shared_ptr<srcDispatch::IfStmtData>)) {
         // Extract all of the block data from if statements
-        std::shared_ptr<srcDispatch::IfStmtData> ifcntl = std::any_cast<std::shared_ptr<srcDispatch::IfStmtData>>(cntl);
+        std::shared_ptr<srcDispatch::IfStmtData> ifcntl = srcDispatch::any_cast<std::shared_ptr<srcDispatch::IfStmtData>>(cntl);
         if (!ifcntl) return;
 
         SlicePosition ifStmtPos(ifcntl->startPosition, ifcntl->endPosition, sctx.currentFilePath);
@@ -755,7 +755,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
         // ifstmts have three potential clauses (if-elseif-else)
         for (const auto& clause : ifcntl->clauses) {
             if (clause.GetElement().type() == typeid(std::shared_ptr<srcDispatch::IfData>)) {
-                std::shared_ptr<srcDispatch::IfData> ifData = std::any_cast<std::shared_ptr<srcDispatch::IfData>>(clause.GetElement());
+                std::shared_ptr<srcDispatch::IfData> ifData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::IfData>>(clause.GetElement());
                 if (!ifData) continue;
 
                 SlicePosition ifPos(ifData->startPosition, ifData->endPosition, sctx.currentFilePath);
@@ -763,7 +763,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
                 if (ifData->condition) {
                     for (auto& elem : ifData->condition->conditions) {
                         if (elem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::DeclData>)) {
-                            auto initData = std::any_cast<std::shared_ptr<srcDispatch::DeclData>>(elem.GetElement());
+                            auto initData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::DeclData>>(elem.GetElement());
                             if (!initData) continue;
 
                             SlicePosition endOfScope(
@@ -774,7 +774,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
 
                             CreateSliceProfile(data, sctx, initData, funcData, className, endOfScope);
                         } else if (elem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::ExpressionData>)) {
-                            std::shared_ptr<srcDispatch::ExpressionData> exprstmt = std::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
+                            std::shared_ptr<srcDispatch::ExpressionData> exprstmt = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
                             ProcessExprStmt(data, sctx, exprstmt, funcData, className, EXPRESSION_TYPE::IF_CONDITION);
                         }
                     }
@@ -786,7 +786,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
 
                 ProcessStmts(data, sctx, funcData, ifData->block, className);
             } else if (clause.GetElement().type() == typeid(std::shared_ptr<srcDispatch::ElseIfData>)) {
-                std::shared_ptr<srcDispatch::ElseIfData> elseIfData = std::any_cast<std::shared_ptr<srcDispatch::ElseIfData>>(clause.GetElement());
+                std::shared_ptr<srcDispatch::ElseIfData> elseIfData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ElseIfData>>(clause.GetElement());
                 if (!elseIfData) continue;
 
                 SlicePosition elifPos(elseIfData->startPosition, elseIfData->endPosition, sctx.currentFilePath);
@@ -794,7 +794,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
                 if(elseIfData->condition) {
                     for (auto& elem : elseIfData->condition->conditions) {
                         if (elem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::DeclData>)) {
-                            auto initData = std::any_cast<std::shared_ptr<srcDispatch::DeclData>>(elem.GetElement());
+                            auto initData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::DeclData>>(elem.GetElement());
                             
                             SlicePosition endOfScope(
                                 elseIfData->endPosition,
@@ -804,7 +804,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
 
                             CreateSliceProfile(data, sctx, initData, funcData, className, endOfScope);
                         } else if (elem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::ExpressionData>)) {
-                            std::shared_ptr<srcDispatch::ExpressionData> exprstmt = std::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
+                            std::shared_ptr<srcDispatch::ExpressionData> exprstmt = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
                             ProcessExprStmt(data, sctx, exprstmt, funcData, className, EXPRESSION_TYPE::ELIF_CONDITION);
                         }
                     }
@@ -816,7 +816,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
 
                 ProcessStmts(data, sctx, funcData, elseIfData->block, className);
             } else if (clause.GetElement().type() == typeid(std::shared_ptr<srcDispatch::ElseData>)) {
-                std::shared_ptr<srcDispatch::ElseData> elseData = std::any_cast<std::shared_ptr<srcDispatch::ElseData>>(clause.GetElement());
+                std::shared_ptr<srcDispatch::ElseData> elseData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ElseData>>(clause.GetElement());
                 if (!elseData) continue;
                 
                 SlicePosition elsePos(elseData->startPosition, elseData->endPosition, sctx.currentFilePath);
@@ -830,7 +830,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
         }
     } else if (cntl.type() == typeid(std::shared_ptr<srcDispatch::SwitchData>)) {
         // Extract all of the block data from Switch statements
-        std::shared_ptr<srcDispatch::SwitchData> switchData = std::any_cast<std::shared_ptr<srcDispatch::SwitchData>>(cntl);
+        std::shared_ptr<srcDispatch::SwitchData> switchData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::SwitchData>>(cntl);
         if (!switchData) return;
 
         /*
@@ -844,18 +844,18 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
         if (switchData->condition) {
             for (const auto& elem : switchData->condition->conditions) {
                 if (elem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::ExpressionData>)) {
-                    std::shared_ptr<srcDispatch::ExpressionData> exprstmt = std::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
+                    std::shared_ptr<srcDispatch::ExpressionData> exprstmt = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
                     ProcessExprStmt(data, sctx, exprstmt, funcData, className);
                     
-                    std::shared_ptr<srcDispatch::ExpressionData> expr = std::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
+                    std::shared_ptr<srcDispatch::ExpressionData> expr = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
                     for (const auto& exprElem : expr->expr) {
                         if (exprElem.GetElement().type() != typeid(std::shared_ptr<srcDispatch::NameData>))
                             continue;
 
-                        controlVariables.push_back(std::any_cast<std::shared_ptr<srcDispatch::NameData>>(exprElem.GetElement()));
+                        controlVariables.push_back(srcDispatch::any_cast<std::shared_ptr<srcDispatch::NameData>>(exprElem.GetElement()));
                     }
                 } else if (elem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::DeclData>)) {
-                    std::shared_ptr<srcDispatch::DeclData> declData = std::any_cast<std::shared_ptr<srcDispatch::DeclData>>(elem.GetElement());
+                    std::shared_ptr<srcDispatch::DeclData> declData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::DeclData>>(elem.GetElement());
 
                     SlicePosition endOfScope(
                         switchData->endPosition,
@@ -920,12 +920,12 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
         ProcessStmts(data, sctx, funcData, switchData->block, className);
     } else if (cntl.type() == typeid(std::shared_ptr<srcDispatch::ForData>)) {
         // Extract all of the block data from For Loops
-        std::shared_ptr<srcDispatch::ForData> forData = std::any_cast<std::shared_ptr<srcDispatch::ForData>>(cntl);
+        std::shared_ptr<srcDispatch::ForData> forData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ForData>>(cntl);
         if (forData && forData->control && forData->control) {
             if (forData->control->init) {
                 for (auto& initData : forData->control->init->inits) {
                     if (initData.GetElement().type() == typeid(std::shared_ptr<srcDispatch::DeclData>)) {
-                        auto declData = std::any_cast<std::shared_ptr<srcDispatch::DeclData>>(initData.GetElement());
+                        auto declData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::DeclData>>(initData.GetElement());
 
                         SlicePosition endOfScope(
                             forData->endPosition,
@@ -937,7 +937,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
 
                         ProcessExprStmt(data, sctx, declData->range, funcData, className);
                     } else if (initData.GetElement().type() == typeid(std::shared_ptr<srcDispatch::ExpressionData>)) {
-                        std::shared_ptr<srcDispatch::ExpressionData> exprstmt = std::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(initData.GetElement());
+                        std::shared_ptr<srcDispatch::ExpressionData> exprstmt = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(initData.GetElement());
                         ProcessExprStmt(data, sctx, exprstmt, funcData, className);
                     }
                 }
@@ -948,7 +948,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
                     if (elem.GetElement().type() != typeid(std::shared_ptr<srcDispatch::ExpressionData>))
                         continue;
 
-                    std::shared_ptr<srcDispatch::ExpressionData> exprstmt = std::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
+                    std::shared_ptr<srcDispatch::ExpressionData> exprstmt = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
                     ProcessExprStmt(data, sctx, exprstmt, funcData, className);
                 }
             }
@@ -968,7 +968,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
         ProcessStmts(data, sctx, funcData, forData->block, className);
     } else if (cntl.type() == typeid(std::shared_ptr<srcDispatch::WhileData>)) {
         // Extract all of the block data from While Loops
-        std::shared_ptr<srcDispatch::WhileData> whileData = std::any_cast<std::shared_ptr<srcDispatch::WhileData>>(cntl);
+        std::shared_ptr<srcDispatch::WhileData> whileData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::WhileData>>(cntl);
         if (!whileData) return;
 
         // C++ do-while does not support decl-stmts within the conditional "()"
@@ -978,7 +978,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
                 if (elem.GetElement().type() != typeid(std::shared_ptr<srcDispatch::ExpressionData>))
                     continue;
 
-                std::shared_ptr<srcDispatch::ExpressionData> exprstmt = std::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
+                std::shared_ptr<srcDispatch::ExpressionData> exprstmt = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
                 ProcessExprStmt(data, sctx, exprstmt, funcData, className);
             }
         }
@@ -991,7 +991,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
         ProcessStmts(data, sctx, funcData, whileData->block, className);
     } else if (cntl.type() == typeid(std::shared_ptr<srcDispatch::DoData>)) {
         // Extract all of the block data from Do-While Loops
-        std::shared_ptr<srcDispatch::DoData> doWhileData = std::any_cast<std::shared_ptr<srcDispatch::DoData>>(cntl);
+        std::shared_ptr<srcDispatch::DoData> doWhileData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::DoData>>(cntl);
         if (!doWhileData) return;
 
         // C++ do-while does not support decl-stmts within the conditional "()"
@@ -999,7 +999,7 @@ void SrcSliceOperations::CollectConditionalData(Blob& data, const SliceCtx& sctx
         if (doWhileData->condition) {
             for (const auto& elem : doWhileData->condition->conditions) {
                 if (elem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::ExpressionData>)) {
-                    std::shared_ptr<srcDispatch::ExpressionData> exprstmt = std::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
+                    std::shared_ptr<srcDispatch::ExpressionData> exprstmt = srcDispatch::any_cast<std::shared_ptr<srcDispatch::ExpressionData>>(elem.GetElement());
                     ProcessExprStmt(data, sctx, exprstmt, funcData, className);
                 }
             }
@@ -1035,7 +1035,7 @@ void SrcSliceOperations::ParseExpr(Blob& data, const SliceCtx& sctx, const std::
     for (const auto& exprElem : expr->expr) {
         if (exprElem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::NameData>)) {
             try {
-                std::shared_ptr<srcDispatch::NameData> nameData = std::any_cast<std::shared_ptr<srcDispatch::NameData>>(exprElem.GetElement());
+                std::shared_ptr<srcDispatch::NameData> nameData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::NameData>>(exprElem.GetElement());
                 if (!nameData) continue;
                 
                 if (ectx.firstNameData == nullptr) ectx.firstNameData = &(*nameData);
@@ -1271,7 +1271,7 @@ void SrcSliceOperations::ParseExpr(Blob& data, const SliceCtx& sctx, const std::
             }
         } else if (exprElem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::OperatorData>)) {
 
-            std::shared_ptr<srcDispatch::OperatorData> opData = std::any_cast<std::shared_ptr<srcDispatch::OperatorData>>(exprElem.GetElement());
+            std::shared_ptr<srcDispatch::OperatorData> opData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::OperatorData>>(exprElem.GetElement());
             std::string current_op_token = opData->op.ToString();
 
             expr_op = (current_op_token == "(" || current_op_token == ")") ? expr_op : current_op_token;
@@ -1360,7 +1360,7 @@ void SrcSliceOperations::ParseExpr(Blob& data, const SliceCtx& sctx, const std::
             // to find the slice profile for the extracted arg
             // and will attempt to insert potential:
             // use/def/call data
-            std::shared_ptr<srcDispatch::CallData> callData = std::any_cast<std::shared_ptr<srcDispatch::CallData>>(exprElem.GetElement());
+            std::shared_ptr<srcDispatch::CallData> callData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::CallData>>(exprElem.GetElement());
 
             if (!callData->name) {
                 std::cerr << "[-] Call Name does not exist!\n";
@@ -1374,7 +1374,7 @@ void SrcSliceOperations::ParseExpr(Blob& data, const SliceCtx& sctx, const std::
             // find root name if needed
             for (const auto& nameElem : callData->name->names) {
                 if (nameElem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::NameData>)) {
-                    std::shared_ptr<srcDispatch::NameData> nameData = std::any_cast<std::shared_ptr<srcDispatch::NameData>>(nameElem.GetElement());
+                    std::shared_ptr<srcDispatch::NameData> nameData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::NameData>>(nameElem.GetElement());
                     if (nameData) {
                         std::string callTarget = nameData->name.ToString();
                         SlicePosition namePos(

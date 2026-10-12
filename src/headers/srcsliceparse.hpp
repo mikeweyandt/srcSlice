@@ -80,7 +80,7 @@ namespace ExprParse {
      * obj.name => obj
      */
 
-    std::string FindName(const std::vector<srcDispatch::DeltaElement<std::any>>& names, SlicePosition& namePos);
+    std::string FindName(const std::vector<srcDispatch::DeltaElement<srcDispatch::Any>>& names, SlicePosition& namePos);
 
     SliceProfile* findValidProfile(SliceProfileIterator spi, ExprParse::ExprCtx& ectx);
 

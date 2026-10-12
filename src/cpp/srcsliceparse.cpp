@@ -22,7 +22,7 @@ IO_TYPE ExprParse::IsIO(const SliceCtx& sctx, const srcDispatch::NameData* nameD
     // check for scoped-call
     for (const auto& nameElem : nameDataPtr->names) {
         if (nameElem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::NameData>)) {
-            std::shared_ptr<srcDispatch::NameData> nameData = std::any_cast<std::shared_ptr<srcDispatch::NameData>>(nameElem.GetElement());
+            std::shared_ptr<srcDispatch::NameData> nameData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::NameData>>(nameElem.GetElement());
             
             if (nameData->name == "cout") return IO_TYPE::STD_OUT;
             else if (nameData->name == "cerr") return IO_TYPE::STD_ERR;
@@ -41,10 +41,10 @@ IO_TYPE ExprParse::IsIO(const SliceCtx& sctx, const srcDispatch::NameData* nameD
  * obj.name => obj
  */
 
-std::string ExprParse::FindName(const std::vector<srcDispatch::DeltaElement<std::any>>& names, SlicePosition& namePos) {
+std::string ExprParse::FindName(const std::vector<srcDispatch::DeltaElement<srcDispatch::Any>>& names, SlicePosition& namePos) {
     for (const auto& nameElem : names) {
         if (nameElem.GetElement().type() == typeid(std::shared_ptr<srcDispatch::NameData>)) {
-            auto nameData = std::any_cast<std::shared_ptr<srcDispatch::NameData>>(nameElem.GetElement());
+            auto nameData = srcDispatch::any_cast<std::shared_ptr<srcDispatch::NameData>>(nameElem.GetElement());
             if (nameData->name.ToString().empty()) continue;
 
             namePos = SlicePosition(

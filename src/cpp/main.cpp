@@ -83,9 +83,13 @@ int main(int argc, char **argv)
             std::cout << "[\033[33mWARNING\033[0m] Expanding Pointer Aliasing may increase the time required to complete the program\n";
         }
 
-        SrcSliceHandler srcSliceHandler(info);
+        // Deliberately never deleted: freeing the hundreds of thousands of slices one by one
+        // at exit took 2 % of a medium run and seconds on the kernel, for memory the process
+        // is about to give back anyway. Every thread has been joined by the time the
+        // constructor returns, so nothing depends on the destructor.
+        SrcSliceHandler* srcSliceHandler = new SrcSliceHandler(info);
 
-        auto& sliceProfileMap = srcSliceHandler.GetProfileMap();
+        auto& sliceProfileMap = srcSliceHandler->GetProfileMap();
 
         if (!outputFile.empty()) {
             // allow output file to be written in
