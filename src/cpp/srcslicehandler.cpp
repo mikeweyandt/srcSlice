@@ -370,7 +370,7 @@ std::unordered_map<std::string, std::vector<SliceProfile>>& SrcSliceHandler::Get
 }
 
 // Find forward control-edges between conditional conditions. ie: if -> else if -> else
-void SrcSliceHandler::ComputeOuterPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines) {
+void SrcSliceHandler::ComputeOuterPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines) {
     /** @todo
      * Checking metadata within each SlicePosition, connect sline[i] to a sline[k] where k > i
      * corresponding if conditions to preceding elif conditions or the first sline within an else
@@ -411,7 +411,7 @@ void SrcSliceHandler::ComputeOuterPaths(std::set<std::pair<SlicePosition,SlicePo
 }
 
 // Collects the forward exiting control-flows of conditionals. ie: exiting conditional body
-void SrcSliceHandler::ComputeExitPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines) {
+void SrcSliceHandler::ComputeExitPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines) {
     /** @todo
      * Find the context if_stmt the sline[i] is within to find the first sline[k] not contained in the context if_stmt where k > i
      * sline[i] must be the sline that occurs LAST within the inner context of the if_stmt context (specific if, elif, else block)
@@ -523,7 +523,7 @@ void SrcSliceHandler::ComputeControlPaths() {
             if (!profile.containsDeclaration) continue;
 
             // Collect the slice lines and put them in numerical order
-            std::set<SlicePosition> sLinesOrdered;
+            PositionSet sLinesOrdered;
             sLinesOrdered.insert(profile.definitions.begin(), profile.definitions.end());
             sLinesOrdered.insert(profile.uses.begin(), profile.uses.end());
 
@@ -600,6 +600,32 @@ SliceProfile* SrcSliceHandler::ParameterProfile(const FunctionSignatureData& fun
     if (param.name.empty()) return nullptr;
 
     const std::string& paramName = param.name;
+
+    // the parameter is declared in the signature's file at the parameter name's position
+    const SlicePosition& paramDeclPos = param.namePosition;
+
+    if (!declaredByPosition.empty()) {
+        // Finalize's index: only the profiles declared at exactly this position, in the order
+        // the parameter name's vector holds them, so the first match is what the scan found.
+        // A position without both ends equals nothing (SlicePosition::operator==).
+        if (paramDeclPos.HasStart() && paramDeclPos.HasEnd()) {
+            auto hit = declaredByPosition.find(DeclaredKey(paramDeclPos));
+            if (hit != declaredByPosition.end()) {
+                for (SliceProfile* candidate : hit->second) {
+                    if (candidate->variableName != paramName) continue;
+                    if (SrcSliceOperations::GetSimpleFunctionName(candidate->function) != simpleFunctionName) continue;
+                    return candidate;
+                }
+            }
+        }
+        if (verboseMode && profileMap.find(paramName) == profileMap.end()) {
+            std::cout << "[-] " << __FUNCTION__ << ":" << __LINE__ << " | Could not find SliceProfile for parameter '"
+                      << paramName << "' of function '" << funcSig.name << "'" << "\n";
+        }
+        return nullptr;
+    }
+
+    // outside Finalize (no index): the scan
     auto spi = profileMap.find(paramName);
     if (spi == profileMap.end()) {
         if (verboseMode) {
@@ -609,11 +635,8 @@ SliceProfile* SrcSliceHandler::ParameterProfile(const FunctionSignatureData& fun
         return nullptr;
     }
 
-    // the parameter is declared in the signature's file at the parameter name's position
-    const SlicePosition& paramDeclPos = param.namePosition;
-
     // cheap position test first: names like `i` have thousands of profiles and the function
-    // name extraction is a string scan (7 % of the run on medium when done for every candidate)
+    // name extraction is a string scan
     for (auto& candidate : spi->second) {
         if (!candidate.containsDeclaration) continue;
         if (candidate.declPosition != paramDeclPos) continue;
@@ -622,6 +645,17 @@ SliceProfile* SrcSliceHandler::ParameterProfile(const FunctionSignatureData& fun
         return &candidate;
     }
     return nullptr;
+}
+
+void SrcSliceHandler::BuildDeclaredIndex() {
+    declaredByPosition.clear();
+    for (auto& [name, profiles] : profileMap) {
+        for (auto& profile : profiles) {
+            if (!profile.containsDeclaration) continue;
+            if (!profile.declPosition.HasStart() || !profile.declPosition.HasEnd()) continue;
+            declaredByPosition[DeclaredKey(profile.declPosition)].push_back(&profile);
+        }
+    }
 }
 
 // Similiar to ComputeInterprocedural but focuses on building
@@ -701,12 +735,17 @@ void SrcSliceHandler::Finalize() {
         mergeFragments(profiles);
     }
 
+    // nothing moves a profile from here on: index them by declaration position for
+    // ParameterProfile (UpdateCalls and ResolveCall call it per call entry)
+    BuildDeclaredIndex();
+
     for (auto& [name, profiles] : profileMap) {
         for (auto& profile : profiles) {
             if (profile.containsDeclaration) UpdateCalls(profile);
         }
     }
     ComputeInterprocedural();
+    declaredByPosition.clear();
 
     if (expandAliases) {
         // each pass can add targets that the next pass follows; 32 hops is far beyond any
@@ -780,15 +819,14 @@ void SrcSliceHandler::UpdateCalls(SliceProfile& sp) {
     std::vector<FunctionCallData> toInsert, toErase;
     
     for (auto itr = sp.cfunctions.begin(); itr != sp.cfunctions.end(); ++itr) {
-        FunctionCallData cfunc = *itr;
+        const FunctionCallData& cfunc = *itr;
 
         // only update cfunc entries that do not have a definition position
         if (!cfunc.funcPos.GetFileName().empty()) {
             continue;
         }
 
-        std::string name = cfunc.functionName;
-        auto funcSig = functionSigMap.find(name);
+        auto funcSig = functionSigMap.find(cfunc.functionName.str());
 
         if (funcSig == functionSigMap.end()) continue;
 
@@ -809,11 +847,11 @@ void SrcSliceHandler::UpdateCalls(SliceProfile& sp) {
             // if a function is overloaded
 
             unsigned int ArgProfParam = cfunc.parameterIndex - 1;
-            std::vector<FunctionSignatureData> signatures;
+            std::vector<const FunctionSignatureData*> signatures;
 
             for (auto& funcData : funcSig->second) {
                 if (cfunc.argumentCount == funcData.parameters.size()) {
-                    signatures.push_back(funcData);
+                    signatures.push_back(&funcData);
                 }
             }
 
@@ -821,7 +859,7 @@ void SrcSliceHandler::UpdateCalls(SliceProfile& sp) {
                 for (auto& funcData : funcSig->second) {
                     if (cfunc.argumentCount == 0 || cfunc.argumentCount >= funcData.parameters.size()) continue;
                     // 1 <= argCount < paramCount
-                    signatures.push_back(funcData);
+                    signatures.push_back(&funcData);
                 }
             }
 
@@ -829,19 +867,19 @@ void SrcSliceHandler::UpdateCalls(SliceProfile& sp) {
             for (size_t i = 0; i < signatures.size(); ++i) {
 
                 // only a signature whose parameter some unit declared can resolve the argument
-                if (!ParameterProfile(signatures[i], ArgProfParam, cfunc.functionName)) continue;
+                if (!ParameterProfile(*signatures[i], ArgProfParam, cfunc.functionName)) continue;
 
                 if (cfunc.funcPos.GetFileName().empty()) {
                     // update cfunc data
                     FunctionCallData updatedData(cfunc);
-                    updatedData.funcPos = signatures[i].position;
+                    updatedData.funcPos = signatures[i]->position;
 
                     toErase.push_back(*itr);
                     toInsert.push_back(updatedData);
                 } else {
                     // append new cfunc data
                     FunctionCallData newData(cfunc);
-                    newData.funcPos = signatures[i].position;
+                    newData.funcPos = signatures[i]->position;
                     toInsert.push_back(newData);
                 }
             }

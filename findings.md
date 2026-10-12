@@ -6,7 +6,7 @@ the line numbers below are those of the reviewed revision. Everything listed is 
 change can fix, ordered by expected payoff. Measured numbers come from the dev container (Ubuntu
 26.04, 32 cores, Release build) unless noted.
 
-## Status (October 2026, srcslice v0.2.8)
+## Status (October 2026, srcslice v0.2.10)
 
 `progress.md` records each step with its gate and numbers. Done, in order: S2 + M5 (condition-variable
 manager, bounded backlog, in-order merge: output no longer depends on the thread count), S1 (one
@@ -14,24 +14,26 @@ resolution pass in `Finalize`; `ResolveCall` writes into the profile being resol
 exact callee parameter first), M6/S8 (streamed output), M1 (32-byte `SlicePosition`), M3 (slim
 signature parameters), M2 (interned profile strings and call names), plus the defaulted copy/move
 members that let the merge move instead of copy; then S3 (dispatcher and SAX per-element
-plumbing, v0.2.7) and S4 (policy data handed over by move, v0.2.8, which also exposed and fixed
-the `ControlPolicy` reset bug listed under correctness).
+plumbing, v0.2.7), S4 (policy data handed over by move, v0.2.8, which also exposed and fixed
+the `ControlPolicy` reset bug listed under correctness), the `ParameterProfile` half of S6 (index
+by declaration position, v0.2.9), the JSON writer's per-position strings (same version), then
+buffered JSON entries and pointer-keyed element lookups in the dispatcher (v0.2.10).
 
-| input | wall v0.1.0 → v0.2.8 | max RSS v0.1.0 → v0.2.8 | output |
+| input | wall v0.1.0 → v0.2.10 | max RSS v0.1.0 → v0.2.10 | output |
 |---|---|---|---|
-| medium (PostgreSQL) | 24.3 s → 11.0 s | 3.0 GB → 1.2 GB | 265 MB → 942 MB |
-| medium-cpp (OpenCV) | 31.2 s → 18.5 s | 4.0 GB → 1.7 GB | 400 MB → 1.7 GB |
-| small with `-c -a` | 22.0 s → 0.23 s | 81 MB → 54 MB | 4.7 MB → 5.7 MB |
+| medium (PostgreSQL) | 24.3 s → 9.5 s | 3.0 GB → 1.3 GB | 265 MB → 942 MB |
+| medium-cpp (OpenCV) | 31.2 s → 13.2 s | 4.0 GB → 1.8 GB | 400 MB → 1.7 GB |
+| small with `-c -a` | 22.0 s → 0.22 s | 81 MB → 53 MB | 4.7 MB → 5.7 MB |
 
 The output grew because the slices now carry the full transitive closure through the call graph;
 before, resolution was frozen after each unit's merge and most cross-unit data never arrived (or
 arrived in the wrong entry, see "Correctness issues"). In recursive call families the closure a
 profile gets still depends on the traversal order of the depth-first `ResolveCall` (documented in
-`progress.md`, Step 2b; a fixpoint would make it exact). Still open: S5-S7 and S9, M4, M7, and the
-kernel inputs have not been re-measured since v0.1.0. The parse thread is still the critical
-path on medium (about 6 s of 11 s, libxml2 about 2 s of that), then `Finalize` (2.5 s, of which
-the `ParameterProfile` scans are a fifth) and the JSON writer (1.5 s, half of it building
-position strings).
+`progress.md`, Step 2b; a fixpoint would make it exact). Still open: S5, the worker-side scans of S6
+(`findValidProfile`, `FetchSliceProfile`, off the critical path), S7, S9, M4, M7, and the kernel
+inputs have not been re-measured since v0.1.0. The parse thread is still the critical path on
+medium (6.0 s of 9.0 s, libxml2 about 2 s of that), then `Finalize` (1.9 s) and the JSON output
+(1.1 s).
 
 ## What the baseline says
 
@@ -358,11 +360,12 @@ Not performance, but worth a ticket each:
 
 1. ~~S1 + S2 + M5 together~~ (done, v0.2.0-v0.2.2).
 2. ~~S8/M6, M3, M1 + M2~~ (done, v0.2.3-v0.2.6).
-3. ~~S3 and S4 in srcDispatch/srcSAX~~ (done, v0.2.7-v0.2.8). Next: S6/S7 (indexes in the global
-   structures; `ParameterProfile` still scans every same-named profile per call), the JSON writer's
-   per-position string building, S5 (thread pool), M4 (slim fragments), sorted vectors instead of
-   `std::set` for the position sets, then the rest of the parse floor (`DeltaElement`/`std::any`
-   model, M7).
+3. ~~S3 and S4 in srcDispatch/srcSAX~~ (done, v0.2.7-v0.2.8); ~~`ParameterProfile` index and the
+   JSON writer's position strings~~ (done, v0.2.9); ~~buffered entries, pointer-keyed element
+   lookups~~ (done, v0.2.10). Next: sorted vectors instead of `std::set` for the position sets (the
+   set inserts of `ResolveCall` are the largest remaining item in `Finalize` and the node overhead
+   about a quarter of the resident memory), M4 (slim fragments), S7, S5 (thread pool), then the
+   `DeltaElement`/`std::any` model (M7), which is what is left of the parse floor.
 4. M7 if the above are not enough for the full kernel.
 
 Measure each step with `./benchmark/run.sh --sizes small,medium,medium-cpp`, confirm the tests

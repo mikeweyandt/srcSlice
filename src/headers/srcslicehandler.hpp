@@ -117,8 +117,8 @@ public:
         we are not focusing on backwards-flows.
     */
     void ComputeControlPaths();
-    void ComputeOuterPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines);
-    void ComputeExitPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines);
+    void ComputeOuterPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines);
+    void ComputeExitPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines);
 
     // The profile of parameter `paramIndex` of the function `funcSig` describes (declared in the
     // signature's file at the parameter's position), or nullptr when no unit produced it.
@@ -152,6 +152,33 @@ private:
 
     std::unordered_map<std::string, std::vector<SliceProfile>> profileMap;
     std::unordered_set <std::string> visited_func;
+
+    // Declared profiles by declaration position, built by Finalize once the fragments are
+    // glued (profiles do not move afterwards) and dropped when it returns. ParameterProfile
+    // used to scan every profile of the parameter's name (thousands for `i`) for each call
+    // entry (perf plan S6). The key mirrors SlicePosition::operator==: both ends present,
+    // same interned file, same coordinates; candidates keep their name vector's order.
+    struct DeclaredKey {
+        const std::string* file;
+        std::uint32_t startLine, startColumn, endLine, endColumn;
+        explicit DeclaredKey(const SlicePosition& p)
+            : file(p.FilePtr()), startLine(static_cast<std::uint32_t>(p.StartLine())),
+              startColumn(static_cast<std::uint32_t>(p.StartColumn())),
+              endLine(static_cast<std::uint32_t>(p.EndLine())),
+              endColumn(static_cast<std::uint32_t>(p.EndColumn())) {}
+        bool operator==(const DeclaredKey&) const = default;
+    };
+    struct DeclaredKeyHash {
+        std::size_t operator()(const DeclaredKey& k) const {
+            std::size_t h = std::hash<const void*>()(k.file);
+            for (std::uint64_t v : {std::uint64_t(k.startLine), std::uint64_t(k.startColumn), std::uint64_t(k.endLine), std::uint64_t(k.endColumn)}) {
+                h ^= (v + 0x9e3779b97f4a7c15ULL) + (h << 6) + (h >> 2);
+            }
+            return h;
+        }
+    };
+    std::unordered_map<DeclaredKey, std::vector<SliceProfile*>, DeclaredKeyHash> declaredByPosition;
+    void BuildDeclaredIndex();
 
     std::vector<SlicePosition> loopdata;
     std::vector<SlicePosition> forloopdata;

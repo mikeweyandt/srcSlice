@@ -24,6 +24,8 @@
 #include <fstream>
 #include <sstream>
 
+#include <flatset.hpp>
+
 #include <srcSAXHandler.hpp>
 #include <srcDispatcher.hpp>
 #include <FunctionPolicy.hpp>
@@ -127,6 +129,9 @@ public:
 
     // the interned path ("" for a default-constructed position); valid for the whole process
     const std::string& GetFileName() const;
+    // the interned pointer itself (nullptr without a file name): equal texts share one pointer,
+    // so it serves as a hash key
+    const std::string* FilePtr() const { return file; }
     PositionMeta& GetData();
     const PositionMeta& GetData() const { return data; }
 
@@ -144,6 +149,13 @@ private:
     bool hasEnd = false;
     PositionMeta data;
 };
+
+// The slice sets, ordered by SlicePosition::operator< (start line and column, file-blind:
+// a known limitation, see findings.md "Correctness issues" for what a file-aware ordering
+// changes and why it is not enabled).
+using PositionSet = FlatSet<SlicePosition>;
+using NamedPositionSet = FlatSet<std::pair<std::string, SlicePosition>>;
+using EdgeSet = FlatSet<std::pair<SlicePosition, SlicePosition>>;
 
 // return if SlicePosition a is contained in the scope of SlicePosition b
 bool IsContained(SlicePosition& a, SlicePosition b);

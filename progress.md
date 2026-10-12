@@ -523,20 +523,80 @@ thread and the allocation churn of the per-close copies, both of which grow with
 it can be reverted independently of the `ControlPolicy` fix (one line) if the moved-from
 state of a policy's `data` between close and the next open is unwanted.
 
-## Where things stand (v0.1.0 → v0.2.8)
+## Step 3c — S6 (ParameterProfile index) and the JSON writer (output-neutral) — done
 
-| input      | wall v0.1.0 | wall v0.2.8 | RSS v0.1.0 | RSS v0.2.8 | output v0.1.0 | output v0.2.8 |
-|------------|------------:|------------:|-----------:|-----------:|--------------:|--------------:|
-| small      |     0.202 s |     0.136 s |      78 MB |      54 MB |        3.6 MB |        4.4 MB |
-| small-ca   |      22.0 s |     0.234 s |      81 MB |      54 MB |        4.7 MB |        5.7 MB |
-| medium     |      24.3 s |      11.0 s |   3,021 MB |   1,243 MB |      265.4 MB |      941.6 MB |
-| medium-cpp |      31.2 s |      18.5 s |   3,973 MB |   1,747 MB |      399.9 MB |       1.69 GB |
+Baseline **v0.2.9**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 8`), suite 9/9 plus
+the regression test, ThreadSanitizer and AddressSanitizer suites clean.
+
+- `Finalize` builds `declaredByPosition` once the fragments are glued (profiles do not move
+  after that): every declared profile with a complete declaration position, keyed on the
+  interned file pointer and the four coordinates, which is exactly what
+  `SlicePosition::operator==` compares. `ParameterProfile` looks the parameter's declaration
+  position up and checks the few candidates for name and simple function name in the order
+  their name's vector holds them, so it returns what the scan returned. It used to walk every
+  profile of the parameter's name (thousands for `i`, `p`, `ctx`) for every call entry, once
+  from `UpdateCalls` and once from `ResolveCall`; outside `Finalize` the scan remains as the
+  fallback. `UpdateCalls` no longer copies each call entry, its name and every candidate
+  signature. The index is dropped when `Finalize` returns.
+- The JSON writer writes positions and numbers straight into the stream
+  (`SlicePosition::WriteStart`/`WriteEnd`, `std::to_chars`) instead of building a `std::string`
+  per position: the same bytes, no temporaries.
+
+| input      | v0.2.8 wall | v0.2.9 wall | Δ wall | v0.2.8 RSS | v0.2.9 RSS |
+|------------|------------:|------------:|-------:|-----------:|------------:|
+| small      |     0.136 s |     0.139 s |   +2 % |      54 MB |      53 MB |
+| small-ca   |     0.234 s |     0.223 s |   -5 % |      54 MB |      53 MB |
+| medium     |      11.0 s |      9.69 s |  -12 % |   1,243 MB |   1,268 MB |
+| medium-cpp |      18.5 s |      14.2 s |  -23 % |   1,747 MB |   1,776 MB |
+
+Phase split on medium: parse 5.8 s, `Finalize` 2.0 s (was 2.5 s), everything else (mostly the
+942 MB of JSON) 1.6 s; 9.4 s in all. medium-cpp gains most because its C++ call entries
+resolve against names with many same-named profiles. The index costs about 25 MB while
+`Finalize` runs, which shows in the peak RSS.
+
+## Step 3d — buffered JSON entries and pointer-keyed element lookups (output-neutral) — done
+
+Baseline **v0.2.10**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 8`), suite 9/9
+plus the regression test.
+
+- Each JSON entry is assembled in one reused `std::string` (`SliceProfile::AppendJson`,
+  `SlicePosition::AppendStart/AppendEnd`) and written with a single `write` call instead of
+  some dozens of `operator<<` calls per entry, each with its sentry, virtual `xsputn` and
+  codecvt check. `operator<<(ostream&, SliceProfile&)` remains and produces the same bytes.
+- The dispatcher looks element handlers up through a direct-mapped cache keyed on libxml2's
+  dictionary pointers for (localname, prefix); every hit is verified against the stored text,
+  so a pointer that means something else only costs a miss. The `elseif` rewrite still goes
+  through the string map, and the cache is reset whenever `process_map`/`process_map2` change.
+  The srcDiff namespace test remembers the last pointer that was not it.
+- `FunctionCallData::operator<` does one three-way compare of the (interned) function names
+  instead of an equality test followed by a less-than.
+
+| input      | v0.2.9 wall | v0.2.10 wall | Δ wall | v0.2.9 RSS | v0.2.10 RSS |
+|------------|------------:|-------------:|-------:|-----------:|------------:|
+| small      |     0.139 s |      0.135 s |   -3 % |      53 MB |       54 MB |
+| small-ca   |     0.223 s |      0.223 s |    0 % |      53 MB |       53 MB |
+| medium     |      9.69 s |       9.48 s |   -2 % |   1,268 MB |    1,272 MB |
+| medium-cpp |      14.2 s |       13.2 s |   -6 % |   1,776 MB |    1,782 MB |
+
+The output phase on medium fell from about 1.6 s to 1.1 s (medium-cpp writes 1.7 GB, hence
+its larger gain); the parse phase did not move measurably (6.0 s), so the per-element string
+hashing the cache replaces was cheaper than its share of samples suggested. Phase split on
+medium: parse 6.0 s, `Finalize` 1.9 s, output 1.1 s; 9.0 s in all.
+
+## Where things stand (v0.1.0 → v0.2.10)
+
+| input      | wall v0.1.0 | wall v0.2.10 | RSS v0.1.0 | RSS v0.2.10 | output v0.1.0 | output v0.2.10 |
+|------------|------------:|-------------:|-----------:|------------:|--------------:|---------------:|
+| small      |     0.202 s |      0.135 s |      78 MB |       54 MB |        3.6 MB |         4.4 MB |
+| small-ca   |      22.0 s |      0.223 s |      81 MB |       53 MB |        4.7 MB |         5.7 MB |
+| medium     |      24.3 s |       9.48 s |   3,021 MB |    1,272 MB |      265.4 MB |       941.6 MB |
+| medium-cpp |      31.2 s |       13.2 s |   3,973 MB |    1,782 MB |      399.9 MB |        1.69 GB |
 
 (small-ca's v0.1.0 figure is its first measurement, taken with the Step 0 binary.) The slices
 now contain the complete transitive closure through the call graph, which is 3.5-4× more data
-than before, computed in 40-45 % of the time and 40-60 % of the memory. On medium the parse
-thread remains the critical path (about 6 s of the 11 s, libxml2 itself about 2 s of that),
-then `Finalize` (2.5 s) and the 942 MB JSON (1.5 s); `-t 1` and `-t 32` still take the same
+than before, computed in about 40 % of the time and 40-45 % of the memory. On medium the parse
+thread remains the critical path (6.0 s of 9.0 s, libxml2 itself about 2 s of that), then
+`Finalize` (1.9 s) and the 942 MB of JSON (1.1 s); `-t 1` and `-t 32` still take the same
 time. Threaded runs are reproducible and identical to `-t 1`; a run with a failing unit
 reports the unit instead of aborting the process; `-c -a` costs a fraction of a second on
 small instead of 22 s.
