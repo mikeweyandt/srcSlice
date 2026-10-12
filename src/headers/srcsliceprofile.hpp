@@ -20,6 +20,7 @@
 #include <string>
 #include <iterator>
 #include <srcslicecollection.hpp> // contains FunctionCallData and other items
+#include <flatset.hpp>
 
 class SliceProfile {
 public:
@@ -27,10 +28,10 @@ public:
 
     SliceProfile(
             std::string name, SlicePosition line, bool alias = 0, bool global = 0,
-            std::set<SlicePosition> aDef = {}, std::set<SlicePosition> aUse = {},
-            std::set<FunctionCallData> cFunc = {},
-            std::set<std::pair<std::string, SlicePosition>> dv = {},
-            std::set<std::pair<SlicePosition, SlicePosition>> edges = {},
+            PositionSet aDef = {}, PositionSet aUse = {},
+            FlatSet<FunctionCallData> cFunc = {},
+            NamedPositionSet dv = {},
+            EdgeSet edges = {},
             bool containsDecl = false, bool visit = false);
 
     // defaulted so the implicit move operations exist: merging and fragment removal move
@@ -64,19 +65,21 @@ public:
     std::string variableName;
     InternedString variableType;
 
-    std::set<SlicePosition> definitions;
-    std::set<SlicePosition> uses;
+    // sorted vectors (flatset.hpp) with std::set's order and duplicate rule; a tree node per
+    // position used to cost more than the position itself
+    PositionSet definitions;
+    PositionSet uses;
 
-    std::set<std::pair<std::string, SlicePosition>> dvars;
-    std::set<std::pair<std::string, SlicePosition>> aliases;
-    std::set<FunctionCallData> cfunctions;
+    NamedPositionSet dvars;
+    NamedPositionSet aliases;
+    FlatSet<FunctionCallData> cfunctions;
 
     SlicePosition endOfScope;
 
     void merge(SliceProfile& other);
     bool inScope(const SlicePosition& pos);
 
-    std::set<std::pair<SlicePosition, SlicePosition>> controlEdges;
+    EdgeSet controlEdges;
 
     // set by ResolveCall: resolved once, and the cycle guard for recursive resolution
     bool visited = false;

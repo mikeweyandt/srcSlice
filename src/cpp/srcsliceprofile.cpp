@@ -16,10 +16,10 @@ SliceProfile::SliceProfile() : containsDeclaration(false), potentialAlias(false)
 
 SliceProfile::SliceProfile(
         std::string name, SlicePosition decl, bool alias, bool global,
-        std::set<SlicePosition> aDef, std::set<SlicePosition> aUse,
-        std::set<FunctionCallData> cFunc,
-        std::set<std::pair<std::string, SlicePosition>> dv,
-        std::set<std::pair<SlicePosition, SlicePosition>> edges,
+        PositionSet aDef, PositionSet aUse,
+        FlatSet<FunctionCallData> cFunc,
+        NamedPositionSet dv,
+        EdgeSet edges,
         bool containsDecl, bool visit) :
         variableName(name), declPosition(decl), potentialAlias(alias),
         isGlobal(global), definitions(aDef), uses(aUse), cfunctions(cFunc),

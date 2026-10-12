@@ -117,8 +117,8 @@ public:
         we are not focusing on backwards-flows.
     */
     void ComputeControlPaths();
-    void ComputeOuterPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines);
-    void ComputeExitPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines);
+    void ComputeOuterPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines);
+    void ComputeExitPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines);
 
     // The profile of parameter `paramIndex` of the function `funcSig` describes (declared in the
     // signature's file at the parameter's position), or nullptr when no unit produced it.

@@ -370,7 +370,7 @@ std::unordered_map<std::string, std::vector<SliceProfile>>& SrcSliceHandler::Get
 }
 
 // Find forward control-edges between conditional conditions. ie: if -> else if -> else
-void SrcSliceHandler::ComputeOuterPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines) {
+void SrcSliceHandler::ComputeOuterPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines) {
     /** @todo
      * Checking metadata within each SlicePosition, connect sline[i] to a sline[k] where k > i
      * corresponding if conditions to preceding elif conditions or the first sline within an else
@@ -411,7 +411,7 @@ void SrcSliceHandler::ComputeOuterPaths(std::set<std::pair<SlicePosition,SlicePo
 }
 
 // Collects the forward exiting control-flows of conditionals. ie: exiting conditional body
-void SrcSliceHandler::ComputeExitPaths(std::set<std::pair<SlicePosition,SlicePosition>>& controlEdges, std::vector<SlicePosition>& sLines) {
+void SrcSliceHandler::ComputeExitPaths(EdgeSet& controlEdges, std::vector<SlicePosition>& sLines) {
     /** @todo
      * Find the context if_stmt the sline[i] is within to find the first sline[k] not contained in the context if_stmt where k > i
      * sline[i] must be the sline that occurs LAST within the inner context of the if_stmt context (specific if, elif, else block)
@@ -523,7 +523,7 @@ void SrcSliceHandler::ComputeControlPaths() {
             if (!profile.containsDeclaration) continue;
 
             // Collect the slice lines and put them in numerical order
-            std::set<SlicePosition> sLinesOrdered;
+            PositionSet sLinesOrdered;
             sLinesOrdered.insert(profile.definitions.begin(), profile.definitions.end());
             sLinesOrdered.insert(profile.uses.begin(), profile.uses.end());
 
