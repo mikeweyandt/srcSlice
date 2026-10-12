@@ -83,9 +83,13 @@ int main(int argc, char **argv)
             std::cout << "[\033[33mWARNING\033[0m] Expanding Pointer Aliasing may increase the time required to complete the program\n";
         }
 
-        SrcSliceHandler srcSliceHandler(info);
+        // Deliberately never deleted: freeing the hundreds of thousands of slices one by one
+        // at exit took 2 % of a medium run and seconds on the kernel, for memory the process
+        // is about to give back anyway. Every thread has been joined by the time the
+        // constructor returns, so nothing depends on the destructor.
+        SrcSliceHandler* srcSliceHandler = new SrcSliceHandler(info);
 
-        auto& sliceProfileMap = srcSliceHandler.GetProfileMap();
+        auto& sliceProfileMap = srcSliceHandler->GetProfileMap();
 
         if (!outputFile.empty()) {
             // allow output file to be written in
@@ -105,6 +109,8 @@ int main(int argc, char **argv)
         sliceOutput << "{\n";
         bool writtenSlices = false;
 
+        // each entry is assembled in this buffer and written once
+        std::string entry;
         for (auto& profiles : sliceProfileMap) {
             for (auto& slice : profiles.second) {
                 if (!slice.containsDeclaration)
@@ -114,12 +120,16 @@ int main(int argc, char **argv)
                 // we need to set the respective bool true
                 slice.expandCalls = expandCalls;
 
-                if (writtenSlices) sliceOutput << ",\n";
+                entry.clear();
+                if (writtenSlices) entry += ",\n";
                 writtenSlices = true;
 
-                sliceOutput << "\"" << slice.jsonKey() << "\":{\n";
-                sliceOutput << slice;
-                sliceOutput << "}";
+                entry += '"';
+                entry += slice.jsonKey();
+                entry += "\":{\n";
+                slice.AppendJson(entry);
+                entry += '}';
+                sliceOutput.write(entry.data(), static_cast<std::streamsize>(entry.size()));
             }
         }
 

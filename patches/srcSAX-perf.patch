@@ -1,0 +1,466 @@
+diff --git a/src/cpp/cppCallbackAdapter.hpp b/src/cpp/cppCallbackAdapter.hpp
+index a7ac89a..9d679bb 100644
+--- a/src/cpp/cppCallbackAdapter.hpp
++++ b/src/cpp/cppCallbackAdapter.hpp
+@@ -81,12 +81,28 @@ public:
+      */
+     void push_element(const char * prefix, const char * localname, int num_attributes, const struct srcsax_attribute* attributes) {
+ 
+-        std::string qualified_name = srcSAXHandler::get_qualified_name(localname, prefix);
+-        const struct srcsax_attribute* type_attr = srcSAXHandler::find_attribute(num_attributes, attributes, "type");
++        // built in place in the pushed slot: no temporary and no copy per element (perf)
++        std::vector<std::string>& stack = handler->get_stack();
++        stack.emplace_back();
++        std::string& qualified_name = stack.back();
++        if(prefix != nullptr) {
++            qualified_name.assign(prefix);
++            qualified_name += ':';
++        }
++        qualified_name += localname;
++
++        const struct srcsax_attribute* type_attr = nullptr;
++        for(int pos = 0; pos < num_attributes; ++pos) {
++            const char* attributeName = attributes[pos].localname;
++            if(attributeName[0] == 't' && strcmp(attributeName, "type") == 0) {
++                type_attr = &attributes[pos];
++                break;
++            }
++        }
+         if(type_attr != nullptr) {
+-            qualified_name += std::string("-type-") + type_attr->value;
++            qualified_name += "-type-";
++            qualified_name += type_attr->value;
+         }
+-        handler->get_stack().push_back(qualified_name);
+     }
+ 
+     /**
+diff --git a/src/cpp/srcSAXController.cpp b/src/cpp/srcSAXController.cpp
+index a87454d..06660f1 100644
+--- a/src/cpp/srcSAXController.cpp
++++ b/src/cpp/srcSAXController.cpp
+@@ -377,9 +377,14 @@ void srcSAXController::parse(srcSAXHandler * handler) {
+ 
+         auto ep = xmlCtxtGetLastError(context->libxml2_context);
+ 
+-        size_t str_length = strlen(ep->message);
+-        ep->message[str_length - 1] = '\0';
+-        SAXError error = { std::string((const char *)ep->message), ep->code };
++        // libxml2 2.15+ can set a code without a message (e.g. XML_ERR_USER_STOP), and
++        // no error is recorded at all when a handler threw a C++ exception.
++        std::string message = "Unknown error from libxml2 - code: " + std::to_string(ep ? ep->code : 0);
++        if (ep && ep->message) {
++            message = ep->message;
++            while (!message.empty() && message.back() == '\n') message.pop_back();
++        }
++        SAXError error = { message, ep ? ep->code : 0 };
+ 
+         throw error;
+     }
+diff --git a/src/srcsax/sax2_srcsax_handler.cpp b/src/srcsax/sax2_srcsax_handler.cpp
+index 4ae05f6..95af196 100644
+--- a/src/srcsax/sax2_srcsax_handler.cpp
++++ b/src/srcsax/sax2_srcsax_handler.cpp
+@@ -137,35 +137,118 @@ static inline void free_srcsax_attributes(int number_attributes, srcsax_attribut
+ 
+ }
+ 
++/**
++ * scratch_srcsax_namespaces / scratch_srcsax_attributes
++ * @param state the handler state that owns the storage
++ *
++ * The same conversions as above into storage owned by the state, for the per-element
++ * callbacks: no calloc, no strndup per attribute and no frees for every element of the
++ * document. The result is valid until the next call. The root and meta-tag paths nest a
++ * second conversion inside the first, so they keep the allocating versions.
++ */
++static inline srcsax_namespace * scratch_srcsax_namespaces(sax2_srcsax_handler * state, int number_namespaces, const xmlChar ** libxml2_namespaces) {
++
++    std::vector<srcsax_namespace> & scratch = state->namespace_scratch;
++    scratch.resize(number_namespaces > 0 ? number_namespaces : 0);
++
++    for(int pos = 0, index = 0; pos < number_namespaces; ++pos, index += 2) {
++
++        scratch[pos].prefix = (const char *)libxml2_namespaces[index];
++        scratch[pos].uri = (const char *)libxml2_namespaces[index + 1];
++
++    }
++
++    return scratch.data();
++}
++
++static inline srcsax_attribute * scratch_srcsax_attributes(sax2_srcsax_handler * state, int number_attributes, const xmlChar ** libxml2_attributes) {
++
++    std::vector<srcsax_attribute> & scratch = state->attribute_scratch;
++    std::vector<std::size_t> & offsets = state->attribute_offsets;
++    std::string & values = state->attribute_values;
++    scratch.resize(number_attributes > 0 ? number_attributes : 0);
++    offsets.resize(number_attributes > 0 ? number_attributes : 0);
++    values.clear();
++
++    // copy the values first (the buffer may grow while they are appended), then point at them
++    for(int pos = 0, index = 0; pos < number_attributes; ++pos, index += 5) {
++
++        offsets[pos] = values.size();
++        values.append((const char *)libxml2_attributes[index + 3], libxml2_attributes[index + 4] - libxml2_attributes[index + 3]);
++        values.push_back('\0');
++
++    }
++
++    for(int pos = 0, index = 0; pos < number_attributes; ++pos, index += 5) {
++
++        scratch[pos].localname = (const char *)libxml2_attributes[index];
++        scratch[pos].prefix = (const char *)libxml2_attributes[index + 1];
++        scratch[pos].uri = (const char *)libxml2_attributes[index + 2];
++        scratch[pos].value = values.data() + offsets[pos];
++
++    }
++
++    return scratch.data();
++}
++
++/**
++ * canonical_namespace
++ * @param cache the one-entry cache for this kind of value
++ * @param root the root element whose namespace strings are the canonical ones
++ * @param first 0 for prefixes, 1 for URIs (the root's array alternates prefix, URI)
++ * @param value the pointer libxml2 passed
++ *
++ * The root's copy of a namespace prefix or URI that has the same text as value, or value
++ * itself when there is none (the last match wins, as the loop it replaces did). The
++ * previous element's answer is reused when the pointer and its text are the same.
++ */
++static inline const xmlChar * canonical_namespace(namespace_cache & cache, const srcml_element & root, int first, const xmlChar * value) {
++
++    if(value == NULL) return NULL;
++
++    if(value == cache.in && strcmp((const char *)value, cache.text.c_str()) == 0) return cache.out;
++
++    const xmlChar * out = value;
++    int ns_length = root.nb_namespaces * 2;
++    for(int i = first; i < ns_length; i += 2)
++        if(root.namespaces[i] && strcmp((const char *)root.namespaces[i], (const char *)value) == 0)
++            out = root.namespaces[i];
++
++    cache.in = value;
++    cache.text = (const char *)value;
++    cache.out = out;
++
++    return out;
++}
++
+ /** 
+  * srcml_element_stack_push
+- * @param context the srcsax_context
+- * @param srcml_element_stack the stack
++ * @param state the handler state (owns the stack and the element strings)
+  * @param prefix the prefix of the element to push
+  * @param localname the name of the element to push
+  *
+  * Push the element on to the stack.
+  */
+- void srcml_element_stack_push(srcsax_context * context, std::vector<const char *> & srcml_element_stack, const char * prefix, const char * localname) {
++ void srcml_element_stack_push(sax2_srcsax_handler * state, const char * prefix, const char * localname) {
+ 
+-    size_t prefix_length = prefix ? strlen(prefix) : 0;
+-    size_t name_length = strlen(localname);
+-    size_t srcml_element_length = prefix ? prefix_length + name_length + 1 : name_length;
+-    char * srcml_element_string = (char *)calloc(srcml_element_length + 1, sizeof(char));
++    // the string lives in state->srcml_element_storage for as long as the element is open
++    std::deque<std::string> & storage = state->srcml_element_storage;
++    storage.emplace_back();
++    std::string & srcml_element_string = storage.back();
+ 
+-    size_t offset = 0;
+     if(prefix) {
+ 
+-        strncat(srcml_element_string, prefix, prefix_length);
+-        srcml_element_string[prefix_length] = ':';
+-        offset = prefix_length + 1;
++        srcml_element_string.assign(prefix);
++        srcml_element_string.push_back(':');
+ 
+     }
+ 
+-    strncat(srcml_element_string + offset, localname, name_length);
++    srcml_element_string.append(localname);
+ 
+-    srcml_element_stack.push_back(srcml_element_string);
++    std::vector<const char *> & srcml_element_stack = state->srcml_element_stack;
++    srcml_element_stack.push_back(srcml_element_string.c_str());
+ 
++    srcsax_context * context = state->context;
+     context->stack_size = srcml_element_stack.size();
+     context->srcml_element_stack = &srcml_element_stack.front();
+ 
+@@ -173,21 +256,19 @@ static inline void free_srcsax_attributes(int number_attributes, srcsax_attribut
+ 
+ /** 
+  * srcml_element_stack_pop
+- * @param context the srcsax_context
+- * @param srcml_element_stack the stack
++ * @param state the handler state (owns the stack and the element strings)
+  *
+  * Pop an element off the stack.
+  */
+- void srcml_element_stack_pop(srcsax_context * context, std::vector<const char *> & srcml_element_stack) {
++ void srcml_element_stack_pop(sax2_srcsax_handler * state) {
+ 
++    std::vector<const char *> & srcml_element_stack = state->srcml_element_stack;
+     if(srcml_element_stack.size() == 0) return;
+ 
+-    const char * srcml_element = srcml_element_stack.back();
+-
+     srcml_element_stack.pop_back();
++    state->srcml_element_storage.pop_back();
+ 
+-    free((void *)srcml_element);
+-
++    srcsax_context * context = state->context;
+     context->stack_size = srcml_element_stack.size();
+     if(context->stack_size == 0)
+         context->srcml_element_stack = 0;
+@@ -300,7 +381,7 @@ void start_root(void * ctx, const xmlChar * localname, const xmlChar * prefix, c
+     xmlParserCtxtPtr ctxt = (xmlParserCtxtPtr) ctx;
+     sax2_srcsax_handler * state = (sax2_srcsax_handler *) ctxt->_private;
+ 
+-    srcml_element_stack_push(state->context, state->srcml_element_stack, (const char *)prefix, (const char *)localname);
++    srcml_element_stack_push(state, (const char *)prefix, (const char *)localname);
+ 
+     state->root = srcml_element(state->context, localname, prefix, URI, nb_namespaces, namespaces, nb_attributes, nb_defaulted, attributes);
+ 
+@@ -390,7 +471,7 @@ void start_element_ns_first(void * ctx, const xmlChar * localname, const xmlChar
+ 
+             if(state->context->terminate) return;
+ 
+-            srcml_element_stack_push(state->context, state->srcml_element_stack, (const char *)citr->prefix, (const char *)citr->localname);
++            srcml_element_stack_push(state, (const char *)citr->prefix, (const char *)citr->localname);
+ 
+             srcsax_namespace * srcsax_namespaces_meta_tag = (srcsax_namespace *)libxml2_namespaces2srcsax_namespaces(citr->nb_namespaces, citr->namespaces);
+             srcsax_attribute * srcsax_attributes_meta_tag = (srcsax_attribute *)libxml2_attributes2srcsax_attributes(citr->nb_attributes, citr->attributes);  
+@@ -402,7 +483,7 @@ void start_element_ns_first(void * ctx, const xmlChar * localname, const xmlChar
+             free_srcsax_namespaces(citr->nb_namespaces, srcsax_namespaces_meta_tag);
+             free_srcsax_attributes(citr->nb_attributes, srcsax_attributes_meta_tag);
+ 
+-            srcml_element_stack_pop(state->context, state->srcml_element_stack);
++            srcml_element_stack_pop(state);
+ 
+         }
+ 
+@@ -438,7 +519,7 @@ void start_element_ns_first(void * ctx, const xmlChar * localname, const xmlChar
+ 
+         if(state->context->terminate) return;
+ 
+-        srcml_element_stack_push(state->context, state->srcml_element_stack, (const char *)prefix, (const char *)localname);
++        srcml_element_stack_push(state, (const char *)prefix, (const char *)localname);
+ 
+         if(state->context->handler->start_element)
+             state->context->handler->start_element(state->context, (const char *)localname, (const char *)prefix, (const char *)URI,
+@@ -452,7 +533,7 @@ void start_element_ns_first(void * ctx, const xmlChar * localname, const xmlChar
+ 
+         ++state->context->unit_count;
+ 
+-        srcml_element_stack_push(state->context, state->srcml_element_stack, (const char *)prefix, (const char *)localname);
++        srcml_element_stack_push(state, (const char *)prefix, (const char *)localname);
+ 
+         if(state->context->terminate) return;
+ 
+@@ -513,10 +594,11 @@ void start_unit(void * ctx, const xmlChar * localname, const xmlChar * prefix, c
+ 
+     if(state->context->terminate) return;
+ 
+-    srcsax_namespace * srcsax_namespaces = (srcsax_namespace *)libxml2_namespaces2srcsax_namespaces(nb_namespaces, namespaces);
+-    srcsax_attribute * srcsax_attributes = (srcsax_attribute *)libxml2_attributes2srcsax_attributes(nb_attributes, attributes);
++    // per-element path: converted into the state's reusable storage, nothing to free
++    srcsax_namespace * srcsax_namespaces = scratch_srcsax_namespaces(state, nb_namespaces, namespaces);
++    srcsax_attribute * srcsax_attributes = scratch_srcsax_attributes(state, nb_attributes, attributes);
+ 
+-    srcml_element_stack_push(state->context, state->srcml_element_stack, (const char *)prefix, (const char *)localname);
++    srcml_element_stack_push(state, (const char *)prefix, (const char *)localname);
+ 
+     int ns_length = state->root.nb_namespaces * 2;
+     for (int i = 0; i < ns_length; i += 2)
+@@ -545,8 +627,6 @@ void start_unit(void * ctx, const xmlChar * localname, const xmlChar * prefix, c
+ 
+     }
+ 
+-    free_srcsax_namespaces(nb_namespaces, srcsax_namespaces);
+-    free_srcsax_attributes(nb_attributes, srcsax_attributes);
+ 
+ #ifdef SRCSAX_DEBUG
+     fprintf(stderr, "HERE: %s %s %d '%s'\n", __FILE__, __FUNCTION__, __LINE__, (const char *)localname);
+@@ -584,19 +664,15 @@ void start_element_ns(void * ctx, const xmlChar * localname, const xmlChar * pre
+     
+     if(state->context->terminate) return;
+ 
+-    srcsax_namespace * srcsax_namespaces = (srcsax_namespace *)libxml2_namespaces2srcsax_namespaces(nb_namespaces, namespaces);
+-    srcsax_attribute * srcsax_attributes = (srcsax_attribute *)libxml2_attributes2srcsax_attributes(nb_attributes, attributes);
++    // per-element path: converted into the state's reusable storage, nothing to free
++    srcsax_namespace * srcsax_namespaces = scratch_srcsax_namespaces(state, nb_namespaces, namespaces);
++    srcsax_attribute * srcsax_attributes = scratch_srcsax_attributes(state, nb_attributes, attributes);
+ 
+-    srcml_element_stack_push(state->context, state->srcml_element_stack, (const char *)prefix, (const char *)localname);
++    srcml_element_stack_push(state, (const char *)prefix, (const char *)localname);
+ 
+-    int ns_length = state->root.nb_namespaces * 2;
+-    for (int i = 0; i < ns_length; i += 2)
+-        if(prefix && state->root.namespaces[i] && strcmp((const char *)state->root.namespaces[i], (const char *)prefix) == 0)
+-            prefix = state->root.namespaces[i];
+-
+-    for (int i = 1; i < ns_length; i += 2)
+-        if(URI && state->root.namespaces[i] && strcmp((const char *)state->root.namespaces[i], (const char *)URI) == 0)
+-            URI = state->root.namespaces[i];
++    // the same prefix and URI arrive for element after element: answered from the cache
++    prefix = canonical_namespace(state->prefix_cache, state->root, 0, prefix);
++    URI = canonical_namespace(state->uri_cache, state->root, 1, URI);
+ 
+     if(state->parse_function && (strcmp((const char *)localname, "function_decl") == 0 || strcmp((const char *)localname, "function") == 0)) {
+ 
+@@ -630,8 +706,6 @@ void start_element_ns(void * ctx, const xmlChar * localname, const xmlChar * pre
+ 
+     }
+ 
+-    free_srcsax_namespaces(nb_namespaces, srcsax_namespaces);
+-    free_srcsax_attributes(nb_attributes, srcsax_attributes);
+ 
+ #ifdef SRCSAX_DEBUG
+     fprintf(stderr, "HERE: %s %s %d '%s'\n", __FILE__, __FUNCTION__, __LINE__, (const char *)localname);
+@@ -690,7 +764,7 @@ void end_element_ns(void * ctx, const xmlChar * localname, const xmlChar * prefi
+ 
+                 for(std::vector<srcml_element>::const_iterator citr = state->meta_tags.begin(); citr < state->meta_tags.end(); ++citr) {
+ 
+-                    srcml_element_stack_push(state->context, state->srcml_element_stack, (const char *)citr->prefix, (const char *)citr->localname);
++                    srcml_element_stack_push(state, (const char *)citr->prefix, (const char *)citr->localname);
+ 
+                     srcsax_namespace * srcsax_namespaces_meta_tag = (srcsax_namespace *)libxml2_namespaces2srcsax_namespaces(citr->nb_namespaces, citr->namespaces);
+                     srcsax_attribute * srcsax_attributes_meta_tag = (srcsax_attribute *)libxml2_attributes2srcsax_attributes(citr->nb_attributes, citr->attributes);  
+@@ -710,7 +784,7 @@ void end_element_ns(void * ctx, const xmlChar * localname, const xmlChar * prefi
+                     free_srcsax_namespaces(citr->nb_namespaces, srcsax_namespaces_meta_tag);
+                     free_srcsax_attributes(citr->nb_attributes, srcsax_attributes_meta_tag);
+ 
+-                    srcml_element_stack_pop(state->context, state->srcml_element_stack);
++                    srcml_element_stack_pop(state);
+ 
+                 }
+ 
+@@ -739,7 +813,7 @@ void end_element_ns(void * ctx, const xmlChar * localname, const xmlChar * prefi
+ 
+         }
+ 
+-        srcml_element_stack_pop(state->context, state->srcml_element_stack);  
++        srcml_element_stack_pop(state);  
+ 
+         if(state->context->terminate) return;
+ 
+@@ -767,7 +841,7 @@ void end_element_ns(void * ctx, const xmlChar * localname, const xmlChar * prefi
+ 
+     } else {
+ 
+-        srcml_element_stack_pop(state->context, state->srcml_element_stack);  
++        srcml_element_stack_pop(state);  
+ 
+         if(state->in_function_header && (strcmp((const char *)localname, "function_decl") == 0 || strcmp((const char *)localname, "function") == 0)) {
+ 
+diff --git a/src/srcsax/sax2_srcsax_handler.hpp b/src/srcsax/sax2_srcsax_handler.hpp
+index 8669448..c1b70b6 100644
+--- a/src/srcsax/sax2_srcsax_handler.hpp
++++ b/src/srcsax/sax2_srcsax_handler.hpp
+@@ -30,6 +30,7 @@
+ 
+ #include <string>
+ #include <vector>
++#include <deque>
+ 
+ /**
+  * srcMLMode
+@@ -94,6 +95,27 @@ struct function_prototype {
+ 
+ };
+ 
++/**
++ * namespace_cache
++ *
++ * The answer of the previous element for a prefix or URI pointer: libxml2 hands the same
++ * interned pointer over for element after element, so the per-element search through the
++ * root's namespaces (a strcmp per namespace) is repeated only when the pointer or its text
++ * changes (perf).
++ */
++struct namespace_cache {
++
++    /** the pointer libxml2 passed */
++    const xmlChar * in = 0;
++
++    /** the text that pointer had, to notice a reused pointer */
++    std::string text;
++
++    /** the canonical pointer it mapped to */
++    const xmlChar * out = 0;
++
++};
++
+ /**
+  * sax2_srcsax_handler
+  *
+@@ -123,6 +145,22 @@ struct sax2_srcsax_handler {
+     /** open srcMLElement stack */
+     std::vector<const char *> srcml_element_stack;
+ 
++    /** the strings srcml_element_stack points at, one per open element; a deque keeps them in
++        place while the stack grows, so no calloc/free pair per element (perf) */
++    std::deque<std::string> srcml_element_storage;
++
++    /** reusable arrays and value storage for the srcsax_attribute / srcsax_namespace lists
++        handed to the per-element callbacks (start_unit, start_element_ns), instead of a calloc,
++        one strndup per attribute and the matching frees for every element (perf) */
++    std::vector<srcsax_attribute> attribute_scratch;
++    std::vector<srcsax_namespace> namespace_scratch;
++    std::vector<std::size_t> attribute_offsets;
++    std::string attribute_values;
++
++    /** per-element prefix/URI canonicalization, answered from the previous element */
++    namespace_cache prefix_cache;
++    namespace_cache uri_cache;
++
+     /** the current parsing mode */
+     srcMLMode mode;
+ 
+diff --git a/src/srcsax/srcsax_controller.cpp b/src/srcsax/srcsax_controller.cpp
+index 302a7be..d884d48 100644
+--- a/src/srcsax/srcsax_controller.cpp
++++ b/src/srcsax/srcsax_controller.cpp
+@@ -353,11 +353,10 @@ int srcsax_parse(struct srcsax_context * context) {
+ 
+         auto ep = xmlCtxtGetLastError(context->libxml2_context);
+ 
+-        size_t str_length = strlen(ep->message);
+-        ep->message[str_length - 1] = '\0';
+-
+-        if(context->srcsax_error)
+-            context->srcsax_error((const char *)ep->message, ep->code);
++        if(context->srcsax_error) {
++            const char * message = (ep && ep->message) ? ep->message : "Unknown error from libxml2";
++            context->srcsax_error(message, ep ? ep->code : 0);
++        }
+ 
+     }
+ 
+@@ -412,16 +411,14 @@ srcsax_create_parser_context(xmlParserInputBufferPtr buffer_input) {
+         return(NULL);
+     }
+ 
+-    input = xmlNewInputStream(ctxt);
++    /* Public API: libxml2 sets base/cur/end itself, so no dependence on the
++       private xmlBuf layout (which changed in libxml2 2.13+). */
++    input = xmlNewIOInputStream(ctxt, buf, XML_CHAR_ENCODING_NONE);
+     if (input == NULL) {
+         xmlFreeParserCtxt(ctxt);
+         return(NULL);
+     }
+ 
+-    input->filename = NULL;
+-    input->buf = buf;
+-    _xmlBufResetInput(input->buf->buffer, input);
+-
+     inputPush(ctxt, input);
+ 
+     return(ctxt);

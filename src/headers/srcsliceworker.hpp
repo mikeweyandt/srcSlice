@@ -126,7 +126,7 @@ namespace SrcSliceOperations {
     // for them, along with capturing expressions to update collected slices
     void CollectTryBlockData(Blob& data, const SliceCtx& sctx, const FunctionInfo& funcData, std::shared_ptr<srcDispatch::TryData>& tryBlock,
                                 const std::string& className);
-    void CollectConditionalData(Blob& data, const SliceCtx& sctx, const FunctionInfo& funcData, std::any& cntl, const std::string& className);
+    void CollectConditionalData(Blob& data, const SliceCtx& sctx, const FunctionInfo& funcData, srcDispatch::Any& cntl, const std::string& className);
     // Given a list of Function Parameters create Initial SliceProfiles for each Parameter
     void ProcessFunctionParameters(Blob& data, const SliceCtx& sctx, const FunctionInfo& funcData, std::vector<DeclInfo>& parameters,
                                     const std::string& currentFunctionName, const std::string& className);
