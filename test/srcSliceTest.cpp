@@ -9,6 +9,9 @@
 
 #include "srcSliceTest.hpp"
 
+#include <algorithm>
+#include <set>
+
 std::string StringToSrcML(std::string str, const char* fileName){ // Function by Cnewman
     struct srcml_archive* archive;
     struct srcml_unit* unit;
@@ -30,9 +33,6 @@ std::string StringToSrcML(std::string str, const char* fileName){ // Function by
     srcml_unit_free(unit);
     srcml_archive_close(archive);
     srcml_archive_free(archive);
-
-    // ensure the final char is null-terminator
-    ch[size-1] = 0;
 
     // Copy the buffer content to a string so we
     // can deallocate the buffer created by:
@@ -75,7 +75,6 @@ std::string StringsToArchive(std::vector<std::string> contents, std::vector<std:
     srcml_archive_close(archive);
     srcml_archive_free(archive);
 
-    ch[size-1] = 0;
     archive_str.append(ch,size);
     srcml_memory_free(ch);
 
@@ -85,7 +84,7 @@ std::string StringsToArchive(std::vector<std::string> contents, std::vector<std:
 std::string RunSrcSlice(std::string srcml, const TestArg& info) {
     std::ostringstream output;
     SrcSliceHandler srcSliceHandler(srcml, info);
-    std::unordered_map<std::string, std::vector<SliceProfile>> profileMap = srcSliceHandler.GetProfileMap();
+    auto& profileMap = srcSliceHandler.GetProfileMap();
 
     output << "{" << std::endl;
     bool writtenSlices = false;
@@ -120,6 +119,57 @@ std::string RunSrcSlice(std::string srcml, const TestArg& info) {
     stream2string += "\n}";
 
     return stream2string;
+}
+
+std::vector<std::string> CanonicalSlices(SrcSliceHandler& handler) {
+    // arrays that come from std::set in srcslice: compared as sets, so sort them
+    static const std::set<std::string> setFields = {"dependence", "aliases", "calls", "use", "definition", "controlEdges"};
+    std::vector<std::string> lines;
+    for (auto& [name, profiles] : handler.GetProfileMap()) {
+        for (auto& slice : profiles) {
+            if (!slice.containsDeclaration) continue;
+            std::ostringstream text;
+            text << "{" << slice << "}";
+            std::string body;
+            json j = json::parse(text.str(), nullptr, false);
+            if (j.is_discarded()) {
+                body = "RAW " + text.str(); // srcslice does not escape quotes in names
+            } else {
+                for (const auto& field : setFields) {
+                    if (!j.contains(field) || !j[field].is_array()) continue;
+                    std::vector<std::string> items;
+                    for (const auto& e : j[field]) items.push_back(e.dump());
+                    std::sort(items.begin(), items.end());
+                    json sorted = json::array();
+                    for (const auto& s : items) sorted.push_back(json::parse(s));
+                    j[field] = sorted;
+                }
+                body = j.dump(); // nlohmann objects are key-sorted
+            }
+            lines.push_back(slice.file + "\t" + slice.variableName + "\t" + slice.declPosition.ToNameString() + "\t" + body);
+        }
+    }
+    std::sort(lines.begin(), lines.end());
+    return lines;
+}
+
+std::vector<std::string> FetchCanonical(std::vector<std::string> contents, std::vector<std::string> filenames, const TestArg& info) {
+    std::string srcml = StringsToArchive(contents, filenames);
+    SrcSliceHandler handler(srcml, info);
+    return CanonicalSlices(handler);
+}
+
+std::string FirstDifference(const std::vector<std::string>& a, const std::vector<std::string>& b) {
+    auto clip = [](const std::string& s) { return s.size() > 400 ? s.substr(0, 400) + "..." : s; };
+    size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (a[i] != b[i]) return "line " + std::to_string(i) + ":\n  A: " + clip(a[i]) + "\n  B: " + clip(b[i]);
+    }
+    if (a.size() != b.size()) {
+        return "sizes differ: " + std::to_string(a.size()) + " vs " + std::to_string(b.size()) +
+               "; extra: " + clip(a.size() > b.size() ? a[n] : b[n]);
+    }
+    return "";
 }
 
 std::string FetchSlices(std::string cppSource) {
@@ -440,7 +490,7 @@ bool CheckDefs(const std::string testName, const std::string sliceId, const json
     }
 }
 
-bool CompareJson(const std::string sourceCode, const std::string testName, const json& produced, const json& expected, bool checkEdges) {
+bool CompareJson(const std::string sourceCode, const std::string testName, const json& produced, const json& expected, bool checkEdges, bool strict) {
     auto printSource = [&sourceCode](){
         std::cout << "==============================" << std::endl;
         std::cout << sourceCode << std::endl;
@@ -466,6 +516,18 @@ bool CompareJson(const std::string sourceCode, const std::string testName, const
                 
             printSource();
             return false;
+        }
+    }
+
+    // strict mode: no slices beyond the expected ones
+    if (strict) {
+        for (auto& [key,value] : produced.items()) {
+            if (!expected.contains(key)) {
+                PrintErr(testName, "Unexpected Slice Data -> " + key);
+                std::cout << " |____ " << value.dump() << std::endl;
+                printSource();
+                return false;
+            }
         }
     }
 

@@ -1,0 +1,212 @@
+{
+  "meta": {
+    "version": "0.1.0",
+    "note": "initial baseline",
+    "timestamp": "2026-10-10T08:01:05Z",
+    "hostname": "f44030a2e7be",
+    "platform": "Linux-7.2.3-ogc3.1.fc44.x86_64-x86_64-with-glibc2.43",
+    "machine": "x86_64",
+    "cpu_count": 32,
+    "mem_gb": 64.8,
+    "in_container": true,
+    "srcml_version": "srcml: 1.2.0",
+    "srcslice": {
+      "path": "/workspaces/srcSlice/build-release/bin/srcslice",
+      "build_type": "Release",
+      "compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+      "commit": "da079ae53f28f2b7ccd5be6ef3c5ba978ea8f972",
+      "dirty": true
+    },
+    "srcslice_args": [],
+    "threads": 32,
+    "merged_inputs": [
+      "x-large"
+    ]
+  },
+  "inputs": {
+    "small": {
+      "commit": "61c1a33a57e3c90b67a7cdf05971f13cce0c6aea",
+      "files": 22,
+      "source_bytes": 1112715,
+      "archive_bytes": 10876861,
+      "srcml_seconds": 0.27
+    },
+    "medium": {
+      "commit": "f58ab18a90460cd297249bc80b13d84b2671bf0c",
+      "files": 2565,
+      "source_bytes": 52901371,
+      "archive_bytes": 523987106,
+      "srcml_seconds": 1.28
+    },
+    "medium-cpp": {
+      "commit": "1e21d6ed7d44c4f7ae9efd4acf302d6cbdf32bff",
+      "files": 2277,
+      "source_bytes": 43271851,
+      "archive_bytes": 585599807,
+      "srcml_seconds": 4.35
+    },
+    "large": {
+      "commit": "3857c2fe5449541e24afc5efdb0f81a8a8f9a3a0",
+      "files": 30315,
+      "source_bytes": 324158481,
+      "archive_bytes": 3678737982,
+      "srcml_seconds": 7.71
+    },
+    "x-large": {
+      "commit": "3857c2fe5449541e24afc5efdb0f81a8a8f9a3a0",
+      "files": 64579,
+      "source_bytes": 1454006513,
+      "archive_bytes": 13194822450,
+      "srcml_seconds": 26.37
+    }
+  },
+  "results": {
+    "small": {
+      "repeat": 5,
+      "wall_median_s": 0.2019,
+      "wall_min_s": 0.2002,
+      "user_s": 0.3585,
+      "sys_s": 0.021,
+      "maxrss_mb": 77.9,
+      "output_bytes": 3597636,
+      "runs": [
+        {
+          "wall_s": 0.2017,
+          "user_s": 0.3667,
+          "sys_s": 0.012,
+          "maxrss_mb": 77.9,
+          "output_bytes": 3597636
+        },
+        {
+          "wall_s": 0.2019,
+          "user_s": 0.3536,
+          "sys_s": 0.0273,
+          "maxrss_mb": 77.1,
+          "output_bytes": 3597636
+        },
+        {
+          "wall_s": 0.2002,
+          "user_s": 0.3558,
+          "sys_s": 0.0212,
+          "maxrss_mb": 77.1,
+          "output_bytes": 3586870
+        },
+        {
+          "wall_s": 0.2051,
+          "user_s": 0.3617,
+          "sys_s": 0.021,
+          "maxrss_mb": 77.2,
+          "output_bytes": 3586870
+        },
+        {
+          "wall_s": 0.2025,
+          "user_s": 0.3585,
+          "sys_s": 0.021,
+          "maxrss_mb": 77.5,
+          "output_bytes": 3597636
+        }
+      ]
+    },
+    "medium": {
+      "repeat": 3,
+      "wall_median_s": 24.334,
+      "wall_min_s": 24.2295,
+      "user_s": 32.7198,
+      "sys_s": 1.0562,
+      "maxrss_mb": 3021.0,
+      "output_bytes": 265345389,
+      "runs": [
+        {
+          "wall_s": 24.2295,
+          "user_s": 32.6147,
+          "sys_s": 1.0562,
+          "maxrss_mb": 3016.1,
+          "output_bytes": 265212463
+        },
+        {
+          "wall_s": 24.4186,
+          "user_s": 32.7388,
+          "sys_s": 1.0717,
+          "maxrss_mb": 3020.8,
+          "output_bytes": 265197876
+        },
+        {
+          "wall_s": 24.334,
+          "user_s": 32.7198,
+          "sys_s": 1.0265,
+          "maxrss_mb": 3021.0,
+          "output_bytes": 265345389
+        }
+      ]
+    },
+    "medium-cpp": {
+      "repeat": 3,
+      "wall_median_s": 31.2163,
+      "wall_min_s": 31.1451,
+      "user_s": 39.853,
+      "sys_s": 1.3522,
+      "maxrss_mb": 3973.4,
+      "output_bytes": 399632938,
+      "runs": [
+        {
+          "wall_s": 31.2163,
+          "user_s": 39.853,
+          "sys_s": 1.3648,
+          "maxrss_mb": 3970.1,
+          "output_bytes": 399875306
+        },
+        {
+          "wall_s": 31.8393,
+          "user_s": 40.6251,
+          "sys_s": 1.2878,
+          "maxrss_mb": 3968.3,
+          "output_bytes": 399599041
+        },
+        {
+          "wall_s": 31.1451,
+          "user_s": 39.745,
+          "sys_s": 1.3522,
+          "maxrss_mb": 3973.4,
+          "output_bytes": 399632938
+        }
+      ]
+    },
+    "large": {
+      "repeat": 3,
+      "wall_median_s": 1622.6525,
+      "wall_min_s": 1613.213,
+      "user_s": 1683.1341,
+      "sys_s": 7.4465,
+      "maxrss_mb": 23681.9,
+      "output_bytes": 1895389051,
+      "runs": [
+        {
+          "wall_s": 1622.6525,
+          "user_s": 1683.1341,
+          "sys_s": 7.6367,
+          "maxrss_mb": 23649.5,
+          "output_bytes": 1892532201
+        },
+        {
+          "wall_s": 1632.3046,
+          "user_s": 1693.6898,
+          "sys_s": 7.2948,
+          "maxrss_mb": 23645.5,
+          "output_bytes": 1893127208
+        },
+        {
+          "wall_s": 1613.213,
+          "user_s": 1674.4761,
+          "sys_s": 7.4465,
+          "maxrss_mb": 23681.9,
+          "output_bytes": 1895389051
+        }
+      ]
+    },
+    "x-large": {
+      "repeat": 1,
+      "error": "srcslice killed by signal 9: /workspaces/srcSlice/build-release/bin/srcslice /workspaces/srcSlice/benchmark/cache/archives/x-large-3857c2fe5449.xml -o /workspaces/srcSlice/benchmark/cache/out/x-large.json\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!\n[-] Call Name does not exist!",
+      "runs": []
+    }
+  }
+}

@@ -5,7 +5,11 @@
 # @copyright Copyright (C) 2013-2024 srcML, LLC. (www.srcML.org)
 
 cmake_minimum_required(VERSION 3.20)
-project(srcSlice)
+
+# Project version lives in VERSION (also used by benchmark/ for baseline versioning)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" SRCSLICE_VERSION)
+string(STRIP "${SRCSLICE_VERSION}" SRCSLICE_VERSION)
+project(srcSlice VERSION ${SRCSLICE_VERSION})
 
 # enable ctest
 enable_testing()
@@ -29,9 +33,34 @@ include_directories(${LIBXML2_INCLUDE_DIR}
                     srcDispatch/src/policy_classes
                     src/headers)
 
+# Sanitizer builds for the unit tests, e.g.
+#   cmake -S . -B build-tsan -G Ninja -DSRCSLICE_SANITIZER=thread -DCMAKE_BUILD_TYPE=RelWithDebInfo
+#   cmake --build build-tsan && ctest --test-dir build-tsan -L srcslice
+# Applied before the subdirectories so srcDispatch/srcSAX are instrumented as well.
+set(SRCSLICE_SANITIZER "" CACHE STRING "Build with -fsanitize=<address|thread|undefined> (empty = off)")
+if(SRCSLICE_SANITIZER)
+    add_compile_options(-fsanitize=${SRCSLICE_SANITIZER} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${SRCSLICE_SANITIZER})
+endif()
+
 add_subdirectory(src)
 add_subdirectory(test)
 add_subdirectory(srcDispatch)
+
+# Output-regression tests: slice a pinned real codebase and compare the result with the
+# golden output recorded in benchmark/golden/ (see benchmark/README.md). The first run of
+# each size fetches and converts its input, so it needs network access and srcml.
+set(SRCSLICE_REGRESSION_SIZES "small" CACHE STRING
+    "benchmark inputs registered as ctest output-regression tests (semicolon list; empty disables)")
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    foreach(SIZE IN LISTS SRCSLICE_REGRESSION_SIZES)
+        add_test(NAME regression-${SIZE}
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/benchmark/bench.py
+                         --verify --sizes ${SIZE} --srcslice $<TARGET_FILE:srcslice>)
+        set_tests_properties(regression-${SIZE} PROPERTIES LABELS "regression" TIMEOUT 7200)
+    endforeach()
+endif()
 
 # custom make target to strictly test srcSlice test suite
 add_custom_target(test_srcslice

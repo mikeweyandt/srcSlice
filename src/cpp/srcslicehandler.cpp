@@ -84,8 +84,8 @@ SrcSliceHandler::SrcSliceHandler(std::string& sourceCodeStr, const TestArg& info
     calculateControlEdges = info.calculateControlEdges;
     expandAliases = info.expandAliases;
 
-    // test-suite contains single-unit tests => multiple threads would be wasteful
-    threadCount = 1;
+    // most test-suite inputs are single units; threading tests pass their own count
+    threadCount = (info.threadCount > 0) ? info.threadCount : 1;
 
     srcSAXController control(sourceCodeStr);
     srcDispatch::srcDispatcher<srcDispatch::UnitPolicy> handler(this);

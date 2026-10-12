@@ -1,0 +1,4 @@
+# Cloned inputs, srcML archives, slice output and per-run results are machine-local.
+cache/
+results/
+__pycache__/

@@ -1,0 +1,31 @@
+{
+	"name": "srcSlice",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"context": "."
+		// Point at a different srcML release without editing the Dockerfile:
+		// "args": { "SRCML_BASE_URL": "https://github.com/srcML/srcML/releases/download/v1.2.0" }
+	},
+
+	// Allow gdb/lldb to attach inside the container.
+	"capAdd": ["SYS_PTRACE"],
+	"securityOpt": ["seccomp=unconfined"],
+
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-vscode.cpptools",
+				"ms-vscode.cmake-tools"
+			],
+			"settings": {
+				"cmake.generator": "Ninja",
+				"cmake.buildDirectory": "${workspaceFolder}/build"
+			}
+		}
+	},
+
+	// srcDispatch (and its nested srcSAX) is a submodule; configure fetches CLI11.hpp into external/.
+	"postCreateCommand": "git submodule update --init --recursive && cmake -S . -B build -G Ninja",
+
+	"remoteUser": "vscode"
+}

@@ -51,6 +51,50 @@ cmake ../srcSlice
 make srcslice
 ```
 
+### Dev container:
+The repository ships a [dev container](.devcontainer/) based on Ubuntu 26.04 with the
+C++ toolchain, libxml2, nlohmann json, Boost headers and srcML 1.2.0 preinstalled
+(srcML comes from the release tarballs, for amd64 and arm64). Open the folder in
+VS Code and pick "Reopen in Container", or use the devcontainer CLI:
+```bash
+devcontainer up --workspace-folder .
+devcontainer exec --workspace-folder . cmake --build build --target srcslice
+```
+Submodules are initialized and CMake is configured into `build/` when the container
+is created. While the srcML release is still a GitHub draft, place the tarballs in
+`.devcontainer/srcml/` first (see the README in that folder).
+
+### Testing:
+`ctest --test-dir build -L srcslice` runs the unit tests (Catch2). Besides the original
+suites there are `testInterprocedural` (cross-unit call resolution, each program run in both
+unit orders), `testDeterminism` (the same archive must give identical slices for 1, 2 and 8
+threads and when repeated) and, from the threading work on, `testThreading`. Cases tagged
+`[!mayfail]` describe intended behaviour that a known defect still breaks; Catch reports them
+without failing the suite, and the comment above each names the change expected to fix it.
+
+Sanitizer builds instrument srcSlice and the srcDispatch/srcSAX submodules:
+```bash
+cmake -S . -B build-tsan -G Ninja -DSRCSLICE_SANITIZER=thread -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-tsan && ctest --test-dir build-tsan -L srcslice --timeout 1800
+```
+(`address` and `undefined` work the same way; with `address` set `ASAN_OPTIONS=detect_leaks=0`,
+libsrcml leaks.) `ctest -R regression` checks a real codebase against its recorded golden
+output; see Benchmarks.
+
+### Benchmarks:
+`benchmark/` times `srcslice` on five inputs from four pinned codebases (srcSlice, PostgreSQL, OpenCV, the Linux kernel without and with `drivers/`)
+and keeps versioned baselines so performance changes can be compared release to release.
+From the dev container:
+```bash
+./benchmark/run.sh             # time the quick set (small, medium, medium-cpp), compare with the baseline, check outputs
+./benchmark/run.sh --sizes all # include the kernel inputs (30+ min)
+./benchmark/run.sh --verify    # only check the slice outputs against the recorded goldens
+./benchmark/run.sh --history   # how every version compares
+```
+Each input has a recorded golden output in `benchmark/golden/`; a timing run and
+`ctest -R regression` fail when a slice no longer matches it. See
+[benchmark/README.md](benchmark/README.md) for the performance-update workflow.
+
 <br>
 
 ## Using srcSlice

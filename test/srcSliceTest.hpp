@@ -36,6 +36,15 @@ std::string FetchSlices(std::vector<std::string> contents, std::vector<std::stri
 
 std::string RunSrcSlice(std::string srcml, const TestArg& info);
 
+// Order-independent form of every declared slice: one sorted line per profile,
+// "file \t name \t decl \t <json with sorted keys and sorted set-valued arrays>".
+// Two runs that produce the same slices give identical vectors whatever the thread
+// count or merge order was (file is part of the identity, unlike the JSON test keys).
+std::vector<std::string> CanonicalSlices(SrcSliceHandler& handler);
+std::vector<std::string> FetchCanonical(std::vector<std::string> contents, std::vector<std::string> filenames, const TestArg& info);
+// First differing line between two canonical vectors, for failure messages ("" if equal).
+std::string FirstDifference(const std::vector<std::string>& a, const std::vector<std::string>& b);
+
 [[maybe_unused]] inline static int testNum = 1; // suppress unused compiler warnings
 [[maybe_unused]] inline static std::string tName;
 // generates test-case name with increment control
@@ -52,6 +61,7 @@ bool CheckCalls(const std::string testName, const std::string sliceId, const jso
 bool CheckUses(const std::string testName, const std::string sliceId, const json& produced, const json& expected);
 bool CheckDefs(const std::string testName, const std::string sliceId, const json& produced, const json& expected);
 // primary check function
-bool CompareJson(const std::string sourceCode, const std::string testName, const json& produced, const json& expected, bool checkEdges = false);
+// strict: also fail when `produced` contains slices that `expected` does not list
+bool CompareJson(const std::string sourceCode, const std::string testName, const json& produced, const json& expected, bool checkEdges = false, bool strict = false);
 
 #endif

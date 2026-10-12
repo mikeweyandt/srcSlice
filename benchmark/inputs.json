@@ -1,0 +1,104 @@
+{
+  "small": {
+    "repo": "https://github.com/srcML/srcSlice.git",
+    "branch": "main",
+    "commit": "61c1a33a57e3c90b67a7cdf05971f13cce0c6aea",
+    "extensions": [
+      ".c",
+      ".h",
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".hh",
+      ".hpp",
+      ".hxx"
+    ]
+  },
+  "small-ca": {
+    "repo": "https://github.com/srcML/srcSlice.git",
+    "branch": "main",
+    "commit": "61c1a33a57e3c90b67a7cdf05971f13cce0c6aea",
+    "extensions": [
+      ".c",
+      ".h",
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".hh",
+      ".hpp",
+      ".hxx"
+    ],
+    "args": [
+      "-c",
+      "-a"
+    ]
+  },
+  "medium": {
+    "repo": "https://github.com/postgres/postgres.git",
+    "branch": "master",
+    "commit": "f58ab18a90460cd297249bc80b13d84b2671bf0c",
+    "extensions": [
+      ".c",
+      ".h",
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".hh",
+      ".hpp",
+      ".hxx"
+    ]
+  },
+  "medium-cpp": {
+    "repo": "https://github.com/opencv/opencv.git",
+    "branch": "5.x",
+    "commit": "1e21d6ed7d44c4f7ae9efd4acf302d6cbdf32bff",
+    "extensions": [
+      ".c",
+      ".h",
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".hh",
+      ".hpp",
+      ".hxx"
+    ],
+    "paths": [
+      "modules",
+      "hal",
+      "apps"
+    ]
+  },
+  "large": {
+    "repo": "https://github.com/torvalds/linux.git",
+    "branch": "master",
+    "commit": "3857c2fe5449541e24afc5efdb0f81a8a8f9a3a0",
+    "extensions": [
+      ".c",
+      ".h",
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".hh",
+      ".hpp",
+      ".hxx"
+    ],
+    "exclude": [
+      "drivers"
+    ]
+  },
+  "x-large": {
+    "repo": "https://github.com/torvalds/linux.git",
+    "branch": "master",
+    "commit": "3857c2fe5449541e24afc5efdb0f81a8a8f9a3a0",
+    "extensions": [
+      ".c",
+      ".h",
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".hh",
+      ".hpp",
+      ".hxx"
+    ]
+  }
+}

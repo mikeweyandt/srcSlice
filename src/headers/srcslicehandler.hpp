@@ -75,6 +75,10 @@ struct TestArg {
     bool calculateControlEdges;
     bool expandCalls;
     bool expandAliases;
+    // threading knobs for the test-suite (0 = handler default)
+    int threadCount = 1;
+    int backlogCap = 0;
+    int maxInFlight = 0;
 };
 
 class SrcSliceHandler : public srcDispatch::PolicyListener {

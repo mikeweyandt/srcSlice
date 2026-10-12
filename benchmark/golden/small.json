@@ -1,0 +1,45 @@
+{
+ "input": "small",
+ "input_commit": "61c1a33a57e3c90b67a7cdf05971f13cce0c6aea",
+ "created": "2026-10-10T18:13:01Z",
+ "note": "initial golden",
+ "version": "0.1.0",
+ "srcslice": {
+  "commit": "6e2ec7d739cb0ee2720e4a97f58163f94ccd006c",
+  "dirty": true,
+  "build_type": "Release"
+ },
+ "srcslice_args": [
+  "-t",
+  "1"
+ ],
+ "canon_format": 1,
+ "entries": 4669,
+ "unparsed_entries": 8,
+ "files": 22,
+ "sha256": "b0e2156194290ac271b1cffdbeb282eb12dfcd582206a1a60df61bbf35531604",
+ "per_file": {
+  "src/catch2/catch.hpp": "43d026cfc6f3a140:2914",
+  "src/cpp/main.cpp": "bf9668614529211e:23",
+  "src/cpp/srcslicecollection.cpp": "8faffbfd77c8cb4a:55",
+  "src/cpp/srcslicehandler.cpp": "0e4eb8eb0f6d1e5b:112",
+  "src/cpp/srcsliceparse.cpp": "5166bbcc12bc0d5a:51",
+  "src/cpp/srcsliceprofile.cpp": "623807d146b5ca63:26",
+  "src/cpp/srcsliceprogress.cpp": "edde56f37c9e3dba:25",
+  "src/cpp/srcsliceworker.cpp": "f20085a0df058c08:271",
+  "src/headers/srcslicecollection.hpp": "853fdda16e993d65:64",
+  "src/headers/srcslicehandler.hpp": "39574f6edface484:52",
+  "src/headers/srcsliceparse.hpp": "0a82e9c68f9ffcc5:49",
+  "src/headers/srcsliceprofile.hpp": "c5e22d697a07a7f6:39",
+  "src/headers/srcsliceprogress.hpp": "2a3f780f37bb3be1:23",
+  "src/headers/srcsliceworker.hpp": "8914a57219bcc824:116",
+  "test/srcSliceTest.cpp": "1c29fd7414a0f335:130",
+  "test/srcSliceTest.hpp": "fd0b66060137e12a:53",
+  "test/testAliasExpand.cpp": "c1050c57863e7f83:5",
+  "test/testCtrlEdges.cpp": "be3a57efade281be:60",
+  "test/testFuncExpand.cpp": "176ed4531300f7e2:9",
+  "test/testGeneral.cpp": "311d20ae3ad69319:128",
+  "test/testMultifile.cpp": "a76fdbd25469dc1e:28",
+  "test/testParseExpr.cpp": "453e6e7fd14a452e:436"
+ }
+}

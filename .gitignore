@@ -1,2 +1,5 @@
 .DS_Store
 external/
+build/
+build-release/
+build-*/
