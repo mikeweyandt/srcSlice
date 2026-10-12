@@ -127,6 +127,9 @@ public:
 
     // the interned path ("" for a default-constructed position); valid for the whole process
     const std::string& GetFileName() const;
+    // the interned pointer itself (nullptr without a file name): equal texts share one pointer,
+    // so it serves as a hash key
+    const std::string* FilePtr() const { return file; }
     PositionMeta& GetData();
     const PositionMeta& GetData() const { return data; }
 
