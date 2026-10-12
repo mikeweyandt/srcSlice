@@ -8,6 +8,9 @@
  */
 
 #include <srcslicehandler.hpp>
+#include <vector>
+#include <algorithm>
+#include <thread>
 
 // determine default max threads
 int defaultThreads() {
@@ -110,30 +113,78 @@ int main(int argc, char **argv)
 
         // opening of the entire JSON object
         sliceOutput << "{\n";
-        bool writtenSlices = false;
 
-        // each entry is assembled in this buffer and written once
-        std::string entry;
+        // The entries, in the order they are written. They are formatted in chunks on
+        // several threads, one wave of chunks at a time, while the previous wave is written
+        // in order: the same bytes as one thread writing entry by entry, and at most two
+        // waves of buffers in memory (perf plan, output phase).
+        std::vector<SliceProfile*> slices;
         for (auto& profiles : sliceProfileMap) {
             for (auto& slice : profiles.second) {
                 if (!slice.containsDeclaration)
                     continue;
-
                 // if we need more call details in the call entries
                 // we need to set the respective bool true
                 slice.expandCalls = expandCalls;
-
-                entry.clear();
-                if (writtenSlices) entry += ",\n";
-                writtenSlices = true;
-
-                entry += '"';
-                entry += slice.jsonKey();
-                entry += "\":{\n";
-                slice.AppendJson(entry);
-                entry += '}';
-                sliceOutput.write(entry.data(), static_cast<std::streamsize>(entry.size()));
+                slices.push_back(&slice);
             }
+        }
+        // Chunks hold about 2 MB of output each (estimated from the entry's set sizes, so an
+        // entry with a million positions is a chunk of its own), a wave is eight chunks, and a
+        // buffer that an oversized entry inflated is released after its wave: the formatting
+        // is fast, the point is not to hold much of the document at once.
+        const std::size_t chunkBytes = 2u << 20;
+        const std::size_t waveChunks = static_cast<std::size_t>(std::clamp(threadCount, 1, 8));
+        std::vector<std::size_t> chunkStarts;   // first entry of each chunk, then slices.size()
+        {
+            std::size_t estimate = 0;
+            for (std::size_t i = 0; i < slices.size(); ++i) {
+                if (i == 0 || estimate >= chunkBytes) {
+                    chunkStarts.push_back(i);
+                    estimate = 0;
+                }
+                const SliceProfile& slice = *slices[i];
+                estimate += 400 + 40 * (slice.uses.size() + slice.definitions.size() + slice.controlEdges.size())
+                                + 60 * (slice.dvars.size() + slice.aliases.size()) + 160 * slice.cfunctions.size();
+            }
+            chunkStarts.push_back(slices.size());
+        }
+        const std::size_t chunks = chunkStarts.size() - 1;
+        auto formatChunk = [&slices, &chunkStarts](std::size_t chunk, std::string& out) {
+            out.clear();
+            for (std::size_t i = chunkStarts[chunk]; i < chunkStarts[chunk + 1]; ++i) {
+                if (i > 0) out += ",\n";
+                out += '"';
+                out += slices[i]->jsonKey();
+                out += "\":{\n";
+                slices[i]->AppendJson(out);
+                out += '}';
+            }
+        };
+        auto formatWave = [&](std::size_t firstChunk, std::vector<std::string>& buffers) {
+            const std::size_t count = std::min(waveChunks, chunks - std::min(chunks, firstChunk));
+            buffers.resize(count);
+            std::vector<std::thread> pool;
+            for (std::size_t k = 1; k < count; ++k) {
+                pool.emplace_back([&, k]() { formatChunk(firstChunk + k, buffers[k]); });
+            }
+            if (count > 0) formatChunk(firstChunk, buffers[0]);
+            for (std::thread& thread : pool) thread.join();
+        };
+        std::vector<std::string> current, next;
+        formatWave(0, current);
+        for (std::size_t firstChunk = 0; firstChunk < chunks; firstChunk += waveChunks) {
+            // the next wave is formatted while this one is written
+            std::thread ahead;
+            if (firstChunk + waveChunks < chunks) {
+                ahead = std::thread([&]() { formatWave(firstChunk + waveChunks, next); });
+            }
+            for (std::string& buffer : current) {
+                sliceOutput.write(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+                if (buffer.capacity() > 4 * chunkBytes) std::string().swap(buffer);
+            }
+            if (ahead.joinable()) ahead.join();
+            current.swap(next);
         }
 
         // closing of the entire JSON object

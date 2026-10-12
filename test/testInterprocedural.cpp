@@ -476,9 +476,9 @@ TEST_CASE("Interprocedural: empty archive and single unit", "[srcslice][interpro
     REQUIRE( CompareJson("", CurrentTest(), one, expected, false, true) );
 }
 
-// Defect (not scheduled in the current plan, listed in findings.md): SlicePosition::operator<
-// compares line and column only, so a.cpp:1:14 and b.cpp:1:14 are "equal" inside v's use set
-// and one of them is silently dropped.
+// Defect (listed in findings.md, measured and left for a product decision in progress.md):
+// SlicePosition::operator< compares line and column only, so a.cpp:1:14 and b.cpp:1:14 are
+// "equal" inside v's use set and one of them is silently dropped.
 TEST_CASE("Interprocedural: equal positions in different files are distinct",
           "[srcslice][interprocedural][!mayfail]") {
     std::vector<std::string> files = {

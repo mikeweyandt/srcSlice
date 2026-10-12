@@ -129,11 +129,20 @@ recovered with `std::any_cast<std::shared_ptr<X>>(elem.GetElement())`. Every `El
 
 ## 4. Hand-off: one `SrcSliceWorker` per unit, bounded
 
+Since v0.2.15 the archive is read by `threads / 2` parsers at once (`--parsers`): `ScanArchive`
+(`src/cpp/srcslicearchive.cpp`) finds the byte range of every top-level `<unit>` in one pass,
+and parser *j* of *N* parses the prolog, units *j*, *j + N*, *j + 2N*, … and the root's end
+tag through libxml2's IO callback (`ChunkStream`), on its own thread with its own
+`srcDispatcher`. Each hands its units over with their archive positions as sequence numbers,
+so the merge below sees the same units in the same order as a single parser; a parser may
+only hand a unit over when fewer than `maxInFlight` units are ahead of the merge frontier.
+
 `UnitPolicy` notifies `SrcSliceHandler`, the single `PolicyListener` registered at construction.
 `SrcSliceHandler::Notify`:
 
 - takes the unit (`policy->Data<UnitData>()`),
-- records `#include`s per file in `fileDependencyTable` (used later to glue fragments),
+- records the unit's `#include`s on the worker (they reach `fileDependencyTable`, used later to
+  glue fragments, when the unit is merged, i.e. in archive order),
 - builds a `SrcSliceWorker` outside the lock, then waits on `spaceCv` until the backlog has fewer
   than `backlogCap` units (`--backlog`, default = threads), gives the worker its sequence number
   (archive order) and pushes it; `backlogCv` wakes the manager.

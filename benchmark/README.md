@@ -18,16 +18,16 @@ Only C/C++ files (`.c .h .cc .cpp .cxx .hh .hpp .hxx`) go into the archives. An 
 and `"exclude"` prunes subdirectories (large drops `drivers/`, 78 % of the kernel's C).
 Inputs that share a repository and commit share one checkout under `cache/repos/`.
 `medium-cpp` is the input that exercises the C++ handling (classes, templates, structured
-bindings) the C codebases never touch. `x-large` is a stress test: with the current
-srcslice it runs for about an hour and needs well over 20 GB of RAM, so skip it with
-`--sizes` while iterating and run it for baselines.
+bindings) the C codebases never touch. `x-large` is a stress test: at v0.2.18 it takes
+about 2.5 minutes and peaks at 36 GB of RAM (v0.1.0 could not finish it at all), so skip it
+with `--sizes` while iterating and run it for baselines.
 
 ## Quick start (inside the dev container)
 
 ```bash
 ./benchmark/run.sh                                   # quick set (small, medium, medium-cpp) vs the latest baseline
 ./benchmark/run.sh --sizes small                     # fastest loop while iterating
-./benchmark/run.sh --sizes all                       # adds the kernel inputs: large ~30 min per run, x-large OOMs
+./benchmark/run.sh --sizes all                       # adds the kernel inputs: large ~25 s and 10 GB, x-large ~2.5 min and 36 GB
 ./benchmark/run.sh --history                         # every baseline version, Δ vs previous and vs first
 ```
 
@@ -50,8 +50,8 @@ into `cache/archives/`, builds an optimized `srcslice` in `build-release/`
 `--bump major|minor|patch` rewrites the root `VERSION` file (also the CMake project
 version). `--save-baseline` writes `baselines/v<VERSION>.json` and refuses to overwrite
 an existing version unless `--force` is given. With `--force` and a `--sizes` subset only
-the inputs you ran are replaced in that version's file and the others are kept, so an
-hour-long `x-large` can be added or refreshed on its own:
+the inputs you ran are replaced in that version's file and the others are kept, so the
+`x-large` run can be added or refreshed on its own:
 
 ```bash
 ./benchmark/run.sh --sizes small,medium,medium-cpp,large --save-baseline --note "initial"
@@ -125,8 +125,8 @@ goldens with the change:
 Goldens exist for the quick set and for `large` (recorded at v0.2.15 with `-t 1`, 1.65 M
 entries; a run takes about a minute and 10 GB now, so `--verify --sizes large` is a routine
 check: `--srcslice-args="-t 32"` verifies the parallel parse against it).
-`--save-golden --sizes all` skips inputs whose latest baseline recorded a failure (`x-large`
-cannot finish on 60 GB). A golden records the input commit, the srcslice commit
+`--save-golden --sizes all` skips inputs whose latest baseline recorded a failure (as `x-large`
+did before v0.2.18). A golden records the input commit, the srcslice commit
 and the arguments it was produced with; verifying against a golden recorded for a different
 input commit or with different arguments prints a warning first.
 
