@@ -144,10 +144,11 @@ Options:
 
 Tuning:
   --backlog INT               Parsed units that may wait for a worker before the parser pauses [Default: threads]
+  --parsers INT               Parsers reading the archive at once, each a strided share of its units [Default: threads / 2]
   --in-flight INT             Started units that may wait to be merged in archive order [Default: 2 x threads]
 ```
-The output does not depend on the thread count: units are merged in archive order, so `-t 1`
-and `-t 32` produce the same bytes. The two tuning options bound how many parsed units and
+The output does not depend on the thread count or the parser count: units are merged in
+archive order, so `-t 1` and `-t 32` produce the same bytes. The two tuning options bound how many parsed units and
 finished-but-unmerged units are held in memory at once.
 
 <br>

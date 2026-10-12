@@ -44,12 +44,13 @@ struct Run {
 };
 
 Run Slice(const std::vector<std::string>& contents, const std::vector<std::string>& names,
-          int threads, int backlogCap = 0, int maxInFlight = 0) {
+          int threads, int backlogCap = 0, int maxInFlight = 0, int parsers = 1) {
     std::string srcml = StringsToArchive(contents, names);
     TestArg arg = {false, false, false};
     arg.threadCount = threads;
     arg.backlogCap = backlogCap;
     arg.maxInFlight = maxInFlight;
+    arg.parserCount = parsers;
     SrcSliceHandler handler(srcml, arg);
     return { CanonicalSlices(handler), handler.GetStats() };
 }
@@ -81,6 +82,39 @@ TEST_CASE("Threading: every thread count and queue size gives the single-threade
         CHECK( run.stats.units == static_cast<size_t>(kUnits) );
         CHECK( run.stats.merged == static_cast<size_t>(kUnits) );
     }
+}
+
+TEST_CASE("Threading: several parsers give the single-threaded result", "[srcslice][threading]") {
+    std::vector<std::string> contents, names;
+    GenerateUnits(kUnits, contents, names);
+
+    Run base = Slice(contents, names, 1);
+    REQUIRE( base.stats.parsers == 1 );
+
+    // the archive is dealt round-robin to the parsers and merged in archive order; the
+    // merge window (in-flight) must hold at least one unit per parser
+    struct Config { int threads, backlog, inFlight, parsers; };
+    for (Config c : { Config{2, 0, 0, 2}, Config{4, 0, 0, 4}, Config{8, 1, 0, 3}, Config{8, 2, 8, 8},
+                      Config{16, 0, 0, 0}, Config{32, 0, 0, 32}, Config{3, 5, 7, 2} }) {
+        INFO( "threads=" << c.threads << " backlog=" << c.backlog << " inFlight=" << c.inFlight << " parsers=" << c.parsers );
+        Run run = Slice(contents, names, c.threads, c.backlog, c.inFlight, c.parsers);
+        bool same = (run.slices == base.slices);
+        INFO( FirstDifference(base.slices, run.slices) );
+        CHECK( same );
+        CHECK( run.stats.units == static_cast<size_t>(kUnits) );
+        CHECK( run.stats.merged == static_cast<size_t>(kUnits) );
+        CHECK( run.stats.parsers >= 1 );
+        CHECK( run.stats.maxInFlight <= (c.inFlight > 0 ? static_cast<size_t>(std::max(c.inFlight, c.threads)) : static_cast<size_t>(2 * c.threads)) );
+        CHECK( run.stats.maxRunning <= static_cast<size_t>(c.threads) );
+    }
+    // more parsers than the archive can use are cut back; a single-unit input stays one parser
+    Run many = Slice(contents, names, 8, 0, 0, 64);
+    CHECK( many.slices == base.slices );
+    CHECK( many.stats.parsers <= static_cast<size_t>(kUnits / 2) );
+    std::vector<std::string> one(contents.begin(), contents.begin() + 1), oneName(names.begin(), names.begin() + 1);
+    Run single = Slice(one, oneName, 4, 0, 0, 4);
+    CHECK( single.stats.parsers == 1 );
+    CHECK( single.stats.units == 1 );
 }
 
 TEST_CASE("Threading: the backlog, in-flight window and worker count stay within their bounds", "[srcslice][threading]") {

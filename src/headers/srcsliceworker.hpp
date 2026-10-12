@@ -190,6 +190,9 @@ public:
 
     // position of the unit in the archive; the manager merges in this order
     std::size_t seq = 0;
+    // the paths the unit includes, recorded into fileDependencyTable when it is merged (so
+    // the table is filled in archive order whichever parser handed the unit over)
+    std::vector<std::string> includes;
     // set when Perform failed; the manager turns it into a run failure naming the unit
     std::exception_ptr error;
     // invoked exactly once by the work thread after jobFinished is set, on every exit path
