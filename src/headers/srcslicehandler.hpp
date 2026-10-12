@@ -147,6 +147,15 @@ public:
     // thread target for managing SrcSliceWorker jobs
     void ManageThreads();
 
+    // The pool of `threadCount` threads that run the units' Perform (perf plan S5: a thread per
+    // unit cost its creation, stack and locale set-up for every file). The manager enqueues a
+    // started unit; a pool thread runs it, then does the completion accounting, after which
+    // nothing on that thread touches the worker again.
+    void StartPool();
+    void StopPool();
+    void Enqueue(SrcSliceWorker* worker);
+    void PoolLoop();
+
 private:
     // Runs the parse callable with the manager thread alive, waits for every unit to be merged
     // and rethrows the first failure (a worker exception or a parse error) as std::runtime_error.
@@ -228,6 +237,12 @@ private:
     bool abortRun = false;               // a worker or the parser failed: drop everything, stop the parser
     std::exception_ptr firstError;       // the failure that set abortRun
     PipelineStats stats;
+
+    std::vector<std::thread> workerPool;
+    std::mutex jobMutex;
+    std::condition_variable jobCv;
+    std::deque<SrcSliceWorker*> jobs;    // started units waiting for a pool thread
+    bool poolStop = false;
 
     int threadCount = 1;
     int parserCount = 1;                 // >= 1; the archive is split when > 1 and it has enough units

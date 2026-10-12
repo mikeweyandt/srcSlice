@@ -818,6 +818,36 @@ medium-cpp `Finalize` 1.83 s (was 2.07 s), of which `ResolveCall` is nearly all.
 megabytes on small are the thread stacks and buffers of a run that is over in a tenth of a
 second.
 
+## Step 9 — S5: a pool of worker threads (output-neutral) — done
+
+Baseline **v0.2.18**. Goldens unchanged (`--verify` exact with `-t 1` and `-t 32`), suite 9/9
+plus the regression test; ThreadSanitizer (suite, `small` with 4 parsers, `medium` with 16)
+and AddressSanitizer (suite, `small -c -a`, `medium-cpp` with 8 parsers) clean.
+
+A per-thread profile of a 32-thread run (medium, `benchmark/cache/profile/v0217/`) showed
+where the parse phase's 1.1 s go now that sixteen parsers share the machine with the
+workers: the parsers wait a third of their time in `Notify` for the merge window, the merge
+thread is idle most of the time (0.8 thread-seconds in all), and the workers run near
+saturation. The run created a thread per unit (2,565 of them), and thread creation, stack
+set-up and the per-thread locale initialization were about a tenth of the workers' time and
+most of the system time. The handler now keeps `-t` persistent threads fed from a job queue:
+the manager enqueues a started unit, a pool thread runs `Perform`, then does the completion
+accounting, after which nothing on that thread touches the worker again (the per-worker
+`onDone` callback, which ran before `Perform` returned, is gone). An aborted run marks the
+units still queued as finished and skips them.
+
+| input      | v0.2.17 wall | v0.2.18 wall | Δ wall | v0.2.17 RSS | v0.2.18 RSS |
+|------------|-------------:|-------------:|-------:|------------:|------------:|
+| small      |      0.100 s |      0.099 s |   -2 % |       66 MB |       62 MB |
+| small-ca   |      0.182 s |      0.181 s |   -1 % |       70 MB |       66 MB |
+| medium     |       1.90 s |       1.83 s |   -3 % |    1,324 MB |    1,354 MB |
+| medium-cpp |       3.28 s |       3.16 s |   -4 % |    1,691 MB |    1,745 MB |
+
+The single-threaded run gains more (medium 6.5 s → 5.9 s), where a thread per unit weighed
+more. The parse phase is CPU-bound now: parsers and workers together exceed the cores, so
+the next gains there are in the workers' own cost (allocation churn, string formatting),
+not in the pipeline.
+
 ## Measured, not applied — a file-aware ordering for the slice sets
 
 The sets order positions with `SlicePosition::operator<`, which compares the start line and
@@ -886,23 +916,27 @@ per byte of source), most of what remains being the position and call-entry data
 slices themselves. `x-large` (the full kernel, 1.45 GB of source) was not re-run; by these
 numbers it would need about five minutes and roughly 40 GB, the container's limit.
 
-## Where things stand (v0.1.0 → v0.2.17)
+## Where things stand (v0.1.0 → v0.2.18)
 
-| input      | wall v0.1.0 | wall v0.2.17 | RSS v0.1.0 | RSS v0.2.17 | output v0.1.0 | output v0.2.17 |
+| input      | wall v0.1.0 | wall v0.2.18 | RSS v0.1.0 | RSS v0.2.18 | output v0.1.0 | output v0.2.18 |
 |------------|------------:|-------------:|-----------:|------------:|--------------:|---------------:|
-| small      |     0.202 s |      0.100 s |      78 MB |       66 MB |        3.6 MB |         4.4 MB |
-| small-ca   |      22.0 s |      0.182 s |      81 MB |       70 MB |        4.7 MB |         5.7 MB |
-| medium     |      24.3 s |       1.90 s |   3,021 MB |    1,324 MB |      265.4 MB |       941.6 MB |
-| medium-cpp |      31.2 s |       3.28 s |   3,973 MB |    1,691 MB |      399.9 MB |        1.69 GB |
-| large      |     1,623 s |       29.6 s*|  23.7 GB   |      9.8 GB*|        1.9 GB |        10.2 GB |
+| small      |     0.202 s |      0.099 s |      78 MB |       62 MB |        3.6 MB |         4.4 MB |
+| small-ca   |      22.0 s |      0.181 s |      81 MB |       66 MB |        4.7 MB |         5.7 MB |
+| medium     |      24.3 s |       1.83 s |   3,021 MB |    1,354 MB |      265.4 MB |       941.6 MB |
+| medium-cpp |      31.2 s |       3.16 s |   3,973 MB |    1,745 MB |      399.9 MB |        1.69 GB |
+| large      |     1,623 s |       23.6 s*|  23.7 GB   |      9.9 GB*|        1.9 GB |        10.2 GB |
+| x-large    |     killed* |        153 s*|  46.6 GB*  |     36.2 GB*|             — |        41.7 GB |
 
-(* large at v0.2.15, one repeat; small-ca's v0.1.0 figure is its first measurement, taken
+(* large and x-large at v0.2.18, one repeat each, 2026-10-11. x-large, the full kernel, was not
+feasible at v0.1.0: the OOM killer ended it after about an hour at 46.6 GB with no output; at
+v0.2.18 it runs in 153 s inside the 40 GB container cap. small-ca's v0.1.0 figure is its first measurement, taken
 with the Step 0 binary.) The slices now contain the complete transitive closure through the
 call graph, which is 3.5-5× more data than before, computed in 8-10 % of the time and about
-43 % of the memory on the medium inputs, and in 2 % of the time and 41 % of the memory on
-the kernel subset. The parse is spread over `threads / 2` parsers and the output over eight
-threads; what runs on one thread is `ResolveCall` (0.5 s of medium's 1.9 s, 1.7 s of
-medium-cpp's 3.3 s), whose call-entry merges wait for the set-ordering decision above.
+44 % of the memory on the medium inputs, and in 1.5 % of the time and 42 % of the memory on
+the kernel subset. The parse is spread over `threads / 2` parsers, the units over a pool of
+`threads` workers and the output over eight threads; what runs on one thread is
+`ResolveCall` (0.5 s of medium's 1.8 s, 1.7 s of medium-cpp's 3.2 s), whose call-entry
+merges wait for the set-ordering decision above.
 Threaded runs are reproducible and identical to `-t 1`; a run with a failing unit reports
 the unit instead of aborting the process; `-c -a` costs a fraction of a second on small
 instead of 22 s.

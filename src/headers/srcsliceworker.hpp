@@ -167,26 +167,25 @@ namespace SrcSliceOperations {
     bool isWhiteSpace(const std::string& str);
 };
 
-// One parsed unit on its way into the main structure. The manager (SrcSliceHandler) starts it,
-// waits for it and merges `data`; the unit model is released as soon as the Blob exists.
+// One parsed unit on its way into the main structure. The manager (SrcSliceHandler) hands it
+// to a pool thread, which runs Perform; the manager merges `data` once Finished() is true.
+// The unit model is released as soon as the Blob exists. (Until v0.2.18 every unit ran on a
+// thread of its own; the pool is perf plan S5.)
 class SrcSliceWorker {
 public:
     SrcSliceWorker(std::shared_ptr<srcDispatch::UnitData> unitData, const srcDispatch::srcSAXEventContext &ctx,
                     bool verboseMode, bool calculateControlEdges);
     ~SrcSliceWorker();
 
-    void Start();
     void Perform();
-    void WaitForJob();
     bool Finished();
 
     std::shared_ptr<srcDispatch::UnitData> unit;
+    // set by Perform as its last action; the pool thread does not touch the worker afterwards
     std::atomic_bool jobFinished{false};
 
-    std::thread work;
     Blob data;
     SliceCtx sctx;
-    bool dispatched;
 
     // position of the unit in the archive; the manager merges in this order
     std::size_t seq = 0;
@@ -195,8 +194,6 @@ public:
     std::vector<std::string> includes;
     // set when Perform failed; the manager turns it into a run failure naming the unit
     std::exception_ptr error;
-    // invoked exactly once by the work thread after jobFinished is set, on every exit path
-    std::function<void()> onDone;
 
     // test-only: called at the top of Perform with the unit's context (throw to simulate a failure)
     inline static std::function<void(const SliceCtx&)> testHook;

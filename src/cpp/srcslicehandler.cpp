@@ -206,6 +206,7 @@ std::exception_ptr SrcSliceHandler::ParseFailure() {
 }
 
 void SrcSliceHandler::RunPipeline(const std::function<void()>& parse) {
+    StartPool();
     std::thread manager(&SrcSliceHandler::ManageThreads, this);
 
     // The manager must learn that the parse is over and be joined on every path, or its
@@ -227,6 +228,7 @@ void SrcSliceHandler::RunPipeline(const std::function<void()>& parse) {
             self->backlogCv.notify_all();
             self->spaceCv.notify_all();
             if (manager.joinable()) manager.join();
+            self->StopPool();
         }
         ~FinishParse() { Run(true); }
     } finish{this, manager};
@@ -279,13 +281,6 @@ void SrcSliceHandler::Notify(const srcDispatch::PolicyDispatcher *policy, const 
     }
     const std::size_t seq = parserNextSeq;
     parserNextSeq += parserSeqStride;
-    worker->onDone = [this]() {
-        {
-            std::lock_guard<std::mutex> lock(backlogMutex);
-            --running;
-        }
-        backlogCv.notify_one();
-    };
 
     std::unique_lock<std::mutex> lock(backlogMutex);
 
@@ -407,9 +402,9 @@ void SrcSliceHandler::ManageThreads() {
                 lock.unlock();
                 spaceCv.notify_all(); // a parser may be waiting for backlog room
                 try {
-                    worker->Start();
+                    Enqueue(worker);
                 } catch (...) {
-                    // thread creation failed: account for it like a finished worker
+                    // no memory for the queue entry: account for it like a finished worker
                     worker->error = std::current_exception();
                     worker->jobFinished.store(true, std::memory_order_release);
                     lock.lock();
@@ -425,7 +420,6 @@ void SrcSliceHandler::ManageThreads() {
                 inFlight.erase(inFlight.begin());
 
                 lock.unlock();
-                worker->WaitForJob(); // completion is already published; this reaps the thread
                 if (worker->error) {
                     FailRun(worker->error, "slicing unit #" + std::to_string(worker->seq + 1)
                                            + " (" + worker->sctx.currentFilePath + ")");
@@ -458,10 +452,69 @@ void SrcSliceHandler::ManageThreads() {
         }
     }
 
-    // aborted: let the running workers publish, then drop every queued and unmerged unit
+    // aborted: let the running workers finish, then drop every queued and unmerged unit
+    // (a unit still in the job queue has not started: the pool skips a stopped run)
+    {
+        std::lock_guard<std::mutex> jobLock(jobMutex);
+        for (SrcSliceWorker* worker : jobs) {
+            worker->jobFinished.store(true, std::memory_order_release);
+            --running;
+        }
+        jobs.clear();
+    }
     backlogCv.wait(lock, [this]() { return running == 0; });
-    inFlight.clear(); // joins the (already finished) threads
+    inFlight.clear();
     backlog.clear();
+}
+
+void SrcSliceHandler::StartPool() {
+    {
+        std::lock_guard<std::mutex> lock(jobMutex);
+        poolStop = false;
+    }
+    const int threads = std::max(threadCount, 1);
+    workerPool.reserve(static_cast<std::size_t>(threads));
+    for (int t = 0; t < threads; ++t) workerPool.emplace_back(&SrcSliceHandler::PoolLoop, this);
+}
+
+void SrcSliceHandler::StopPool() {
+    {
+        std::lock_guard<std::mutex> lock(jobMutex);
+        poolStop = true;
+    }
+    jobCv.notify_all();
+    for (std::thread& thread : workerPool) {
+        if (thread.joinable()) thread.join();
+    }
+    workerPool.clear();
+}
+
+void SrcSliceHandler::Enqueue(SrcSliceWorker* worker) {
+    {
+        std::lock_guard<std::mutex> lock(jobMutex);
+        jobs.push_back(worker);
+    }
+    jobCv.notify_one();
+}
+
+void SrcSliceHandler::PoolLoop() {
+    for (;;) {
+        SrcSliceWorker* worker = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(jobMutex);
+            jobCv.wait(lock, [this]() { return poolStop || !jobs.empty(); });
+            if (jobs.empty()) return;   // stopped and drained
+            worker = jobs.front();
+            jobs.pop_front();
+        }
+        worker->Perform();   // publishes jobFinished as its last action
+        // the completion accounting; the worker may be merged and destroyed from here on
+        {
+            std::lock_guard<std::mutex> lock(backlogMutex);
+            --running;
+        }
+        backlogCv.notify_one();
+    }
 }
 
 std::unordered_map<std::string, std::vector<SliceProfile>>& SrcSliceHandler::GetProfileMap() {
