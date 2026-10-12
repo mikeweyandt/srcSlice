@@ -1,0 +1,251 @@
+{
+  "meta": {
+    "version": "0.2.4",
+    "note": "M1+M6: 32-byte SlicePosition with interned file names; output streamed",
+    "timestamp": "2026-10-11T00:52:05Z",
+    "hostname": "f44030a2e7be",
+    "platform": "Linux-7.2.3-ogc3.1.fc44.x86_64-x86_64-with-glibc2.43",
+    "machine": "x86_64",
+    "cpu_count": 32,
+    "mem_gb": 64.8,
+    "in_container": true,
+    "srcml_version": "srcml: 1.2.0",
+    "srcslice": {
+      "path": "/workspaces/srcSlice/build-release/bin/srcslice",
+      "build_type": "Release",
+      "compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+      "commit": "9f4ffca5d74c77c19749a1ce30118554e2ed4775",
+      "dirty": true
+    },
+    "srcslice_args": [],
+    "threads": 32
+  },
+  "inputs": {
+    "small": {
+      "commit": "61c1a33a57e3c90b67a7cdf05971f13cce0c6aea",
+      "files": 22,
+      "source_bytes": 1112715,
+      "archive_bytes": 10876861,
+      "srcml_seconds": 0.27
+    },
+    "small-ca": {
+      "commit": "61c1a33a57e3c90b67a7cdf05971f13cce0c6aea",
+      "files": 22,
+      "source_bytes": 1112715,
+      "archive_bytes": 10876861,
+      "srcml_seconds": 0.27
+    },
+    "medium": {
+      "commit": "f58ab18a90460cd297249bc80b13d84b2671bf0c",
+      "files": 2565,
+      "source_bytes": 52901371,
+      "archive_bytes": 523987106,
+      "srcml_seconds": 1.28
+    },
+    "medium-cpp": {
+      "commit": "1e21d6ed7d44c4f7ae9efd4acf302d6cbdf32bff",
+      "files": 2277,
+      "source_bytes": 43271851,
+      "archive_bytes": 585599807,
+      "srcml_seconds": 4.35
+    }
+  },
+  "results": {
+    "small": {
+      "repeat": 5,
+      "wall_median_s": 0.1885,
+      "wall_min_s": 0.1738,
+      "user_s": 0.2039,
+      "sys_s": 0.0334,
+      "maxrss_mb": 53.0,
+      "output_bytes": 4371203,
+      "runs": [
+        {
+          "wall_s": 0.1919,
+          "user_s": 0.2209,
+          "sys_s": 0.035,
+          "maxrss_mb": 52.0,
+          "output_bytes": 4371203
+        },
+        {
+          "wall_s": 0.1885,
+          "user_s": 0.2172,
+          "sys_s": 0.0334,
+          "maxrss_mb": 53.0,
+          "output_bytes": 4371203
+        },
+        {
+          "wall_s": 0.1749,
+          "user_s": 0.2035,
+          "sys_s": 0.0252,
+          "maxrss_mb": 51.4,
+          "output_bytes": 4371203
+        },
+        {
+          "wall_s": 0.1896,
+          "user_s": 0.1989,
+          "sys_s": 0.0521,
+          "maxrss_mb": 52.5,
+          "output_bytes": 4371203
+        },
+        {
+          "wall_s": 0.1738,
+          "user_s": 0.2039,
+          "sys_s": 0.0254,
+          "maxrss_mb": 52.5,
+          "output_bytes": 4371203
+        }
+      ],
+      "output_check": {
+        "status": "ok",
+        "entries": 4669,
+        "files": 22,
+        "unparsed_entries": 8,
+        "changed_files": 0,
+        "added_files": 0,
+        "removed_files": 0,
+        "digest_s": 0.08
+      }
+    },
+    "small-ca": {
+      "repeat": 5,
+      "wall_median_s": 0.2742,
+      "wall_min_s": 0.2588,
+      "user_s": 0.2948,
+      "sys_s": 0.0377,
+      "maxrss_mb": 52.9,
+      "output_bytes": 5692009,
+      "runs": [
+        {
+          "wall_s": 0.2742,
+          "user_s": 0.3031,
+          "sys_s": 0.0305,
+          "maxrss_mb": 52.9,
+          "output_bytes": 5692009
+        },
+        {
+          "wall_s": 0.2781,
+          "user_s": 0.2935,
+          "sys_s": 0.0444,
+          "maxrss_mb": 51.8,
+          "output_bytes": 5692009
+        },
+        {
+          "wall_s": 0.2588,
+          "user_s": 0.2848,
+          "sys_s": 0.0263,
+          "maxrss_mb": 50.9,
+          "output_bytes": 5692009
+        },
+        {
+          "wall_s": 0.2852,
+          "user_s": 0.2995,
+          "sys_s": 0.0494,
+          "maxrss_mb": 51.4,
+          "output_bytes": 5692009
+        },
+        {
+          "wall_s": 0.2727,
+          "user_s": 0.2948,
+          "sys_s": 0.0377,
+          "maxrss_mb": 52.4,
+          "output_bytes": 5692009
+        }
+      ],
+      "output_check": {
+        "status": "ok",
+        "entries": 4669,
+        "files": 22,
+        "unparsed_entries": 8,
+        "changed_files": 0,
+        "added_files": 0,
+        "removed_files": 0,
+        "digest_s": 0.1
+      }
+    },
+    "medium": {
+      "repeat": 3,
+      "wall_median_s": 13.1618,
+      "wall_min_s": 13.1558,
+      "user_s": 14.4331,
+      "sys_s": 1.128,
+      "maxrss_mb": 1642.1,
+      "output_bytes": 941594505,
+      "runs": [
+        {
+          "wall_s": 13.2056,
+          "user_s": 14.4574,
+          "sys_s": 1.1294,
+          "maxrss_mb": 1642.1,
+          "output_bytes": 941594505
+        },
+        {
+          "wall_s": 13.1558,
+          "user_s": 14.4331,
+          "sys_s": 1.1177,
+          "maxrss_mb": 1642.1,
+          "output_bytes": 941594505
+        },
+        {
+          "wall_s": 13.1618,
+          "user_s": 14.4136,
+          "sys_s": 1.128,
+          "maxrss_mb": 1641.9,
+          "output_bytes": 941594505
+        }
+      ],
+      "output_check": {
+        "status": "ok",
+        "entries": 217200,
+        "files": 2419,
+        "unparsed_entries": 0,
+        "changed_files": 0,
+        "added_files": 0,
+        "removed_files": 0,
+        "digest_s": 14.02
+      }
+    },
+    "medium-cpp": {
+      "repeat": 3,
+      "wall_median_s": 21.6528,
+      "wall_min_s": 21.5572,
+      "user_s": 22.5126,
+      "sys_s": 1.3509,
+      "maxrss_mb": 2227.0,
+      "output_bytes": 1689385099,
+      "runs": [
+        {
+          "wall_s": 21.5572,
+          "user_s": 22.4539,
+          "sys_s": 1.3509,
+          "maxrss_mb": 2227.0,
+          "output_bytes": 1689385099
+        },
+        {
+          "wall_s": 21.7049,
+          "user_s": 22.6324,
+          "sys_s": 1.3448,
+          "maxrss_mb": 2225.9,
+          "output_bytes": 1689385099
+        },
+        {
+          "wall_s": 21.6528,
+          "user_s": 22.5126,
+          "sys_s": 1.399,
+          "maxrss_mb": 2226.2,
+          "output_bytes": 1689385099
+        }
+      ],
+      "output_check": {
+        "status": "ok",
+        "entries": 243246,
+        "files": 2055,
+        "unparsed_entries": 49357,
+        "changed_files": 0,
+        "added_files": 0,
+        "removed_files": 0,
+        "digest_s": 19.4
+      }
+    }
+  }
+}

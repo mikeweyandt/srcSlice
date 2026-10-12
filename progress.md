@@ -333,3 +333,112 @@ Against the starting point (v0.1.0: medium 24.3 s / 3,021 MB / 265 MB output; me
   the options in the recap (cap the propagation depth, keep the complete closure, or compute
   it exactly with a fixpoint). The memory items in `findings.md` (shared file-name strings,
   streaming the output) become the next lever either way.
+
+## Step 1b — defaulted copy/move members (output-neutral) — done
+
+Baseline **v0.2.3**. Applied from the stash after 2b; with `partial` gone nothing depends on
+what the hand-written copy constructors omitted, and the goldens are unchanged (`--verify`
+exact on all four inputs with `-t 1`). `SliceProfile`, `SlicePosition`, `FunctionCallData`
+and `SliceCtx` have `= default` copy and move operations; the merge appends, `std::partition`
+and `erase` in `mergeFragments` now move profiles instead of deep-copying eight strings and
+six sets.
+
+| input      | v0.2.2 wall | v0.2.3 wall | Δ wall | v0.2.2 RSS | v0.2.3 RSS |
+|------------|------------:|------------:|-------:|-----------:|-----------:|
+| small      |     0.189 s |     0.198 s |   +5 % |      78 MB |      70 MB |
+| small-ca   |     1.18 s  |     1.16 s  |   -2 % |      81 MB |      72 MB |
+| medium     |      25.3 s |      16.5 s |  -35 % |   5,978 MB |   5,873 MB |
+| medium-cpp |      34.9 s |      32.6 s |   -7 % |   9,362 MB |   9,261 MB |
+
+medium's user time fell from 27.2 s to 17.6 s. medium-cpp gains little because its time is
+the 1.7 GB output (next step).
+
+## Memory step, part 1 — M1 + M6 (output-neutral) — done
+
+Baseline **v0.2.4**. Goldens unchanged (byte-identical output), suite 9/9.
+
+- **M1.** `SlicePosition` is now 32 bytes: an interned file name (one `std::string` per
+  distinct path for the whole process, shared by every position in that file, via
+  `SlicePosition::InternFileName` with a per-thread cache so workers do not take the lock
+  per position) and four 32-bit coordinates, instead of its own `std::string` plus two
+  `DeltaElement<Position>` (about 200 bytes). Every `uses`, `definitions`, `controlEdges`,
+  `dvars`, `aliases` set element and both positions of every call entry shrink with it, and
+  copying a position no longer allocates. Ordering, equality (incl. the file-blind
+  `operator<`) and all string forms are ported unchanged.
+- **M6.** `main.cpp` streams each slice straight to the file or stdout instead of building the
+  whole document in an `ostringstream`, copying it into a string and writing that. The JSON
+  writer iterates its sets by reference instead of copying every element.
+
+| input      | v0.2.3 wall | v0.2.4 wall | v0.2.3 RSS | v0.2.4 RSS | Δ RSS |
+|------------|------------:|------------:|-----------:|-----------:|------:|
+| small      |     0.198 s |     0.189 s |      70 MB |      53 MB | -24 % |
+| small-ca   |     1.16 s  |     0.27 s  |      72 MB |      53 MB | -27 % |
+| medium     |      16.5 s |      13.2 s |   5,873 MB |   1,642 MB | -72 % |
+| medium-cpp |      32.6 s |      21.7 s |   9,261 MB |   2,227 MB | -76 % |
+
+Against the starting point v0.1.0, medium now produces 3.5× the slice data (942 MB vs
+265 MB of JSON) in half the time (13.2 s vs 24.3 s) and half the memory (1.6 vs 3.0 GB);
+medium-cpp 4.2× the data (1.7 GB vs 400 MB) in 21.7 s vs 31.2 s and 2.2 vs 4.0 GB.
+
+## Memory step, part 2 — M3 (output-neutral) — done
+
+Baseline **v0.2.5**. Goldens unchanged, suite 9/9, ThreadSanitizer suite clean.
+
+`FunctionSignatureData` stored each parameter as the unit model's
+`DeltaElement<shared_ptr<DeclData>>`, which kept the parameter's `DeclData`, `TypeData` and
+`NameData` trees alive for the whole run although resolution only ever needs the parameter's
+name and the position of that name. It now copies out a `SignatureParameter {name,
+namePosition}`; `ParameterProfile` reads those directly. `Finalize` (with `-v`/`-p`) prints
+what it starts from; on medium: 276,919 profiles (59,719 of them fragments), 1.22 M
+positions and 488 k call entries before the closure, which grows them to 6.0 M positions
+and about 3.3 M call entries.
+
+| input      | v0.2.4 wall | v0.2.5 wall | v0.2.4 RSS | v0.2.5 RSS | Δ RSS |
+|------------|------------:|------------:|-----------:|-----------:|------:|
+| small      |     0.189 s |     0.184 s |      53 MB |      53 MB |   0 % |
+| small-ca   |     0.274 s |     0.275 s |      53 MB |      51 MB |  -3 % |
+| medium     |      13.2 s |      12.9 s |   1,642 MB |   1,492 MB |  -9 % |
+| medium-cpp |      21.7 s |      21.2 s |   2,227 MB |   2,065 MB |  -7 % |
+
+## Memory step, part 3 — M2 (output-neutral) — done
+
+Baseline **v0.2.6**. Goldens unchanged, suite 9/9, ThreadSanitizer and AddressSanitizer suites
+clean (the sanitizer builds need about 1.3 GB per translation unit; build them with `-j 8` on
+a desktop, a full-parallel AddressSanitizer build froze the host on 2026-10-10).
+
+`InternedString` (in `srcslicecollection.hpp`) holds a pointer to one process-wide copy of a
+text; comparison and ordering are by text so sets keyed on it behave as before. It replaces
+`std::string` for `SliceProfile::file`, `function`, `nameOfContainingClass`, `language`,
+`checksum`, `variableType` and for `FunctionCallData::functionName`, i.e. for the strings that
+are repeated per unit, per function or per call entry (about 3.3 M call entries on medium each
+carried their own copy of the callee's name). The interner uses a per-thread cache and takes
+its lock only on a miss; `SlicePosition::InternFileName` now goes through the same pool.
+
+| input      | v0.2.5 wall | v0.2.6 wall | v0.2.5 RSS | v0.2.6 RSS | Δ RSS |
+|------------|------------:|------------:|-----------:|-----------:|------:|
+| small      |     0.184 s |     0.193 s |      53 MB |      51 MB |  -5 % |
+| small-ca   |     0.275 s |     0.273 s |      51 MB |      50 MB |  -1 % |
+| medium     |      12.9 s |      12.8 s |   1,492 MB |   1,242 MB | -17 % |
+| medium-cpp |      21.2 s |      20.7 s |   2,065 MB |   1,747 MB | -15 % |
+
+Remaining memory levers, not done: M4 (fragments are full `SliceProfile`s until `Finalize`;
+60 k of 277 k profiles on medium), the `std::set` node overhead of the position sets (32 bytes
+per element on top of the 32-byte position; sorted vectors built once in `Finalize` would
+halve it), and M7 (the srcDispatch object model) for the transient parse memory.
+
+## Where things stand (v0.1.0 → v0.2.6)
+
+| input      | wall v0.1.0 | wall v0.2.6 | RSS v0.1.0 | RSS v0.2.6 | output v0.1.0 | output v0.2.6 |
+|------------|------------:|------------:|-----------:|-----------:|--------------:|--------------:|
+| small      |     0.202 s |     0.193 s |      78 MB |      51 MB |        3.6 MB |        4.4 MB |
+| small-ca   |      22.0 s |     0.273 s |      81 MB |      50 MB |        4.7 MB |        5.7 MB |
+| medium     |      24.3 s |      12.8 s |   3,021 MB |   1,242 MB |      265.4 MB |      941.6 MB |
+| medium-cpp |      31.2 s |      20.7 s |   3,973 MB |   1,747 MB |      399.9 MB |       1.69 GB |
+
+(small-ca's v0.1.0 figure is its first measurement, taken with the Step 0 binary.) The slices
+now contain the complete transitive closure through the call graph, which is 3.5-4× more data
+than before, computed in about half the time and 60 % of the memory. The output itself is the
+largest remaining cost on the medium inputs: 942 MB and 1.7 GB of JSON written per run.
+Threaded runs are reproducible and identical to `-t 1`; a run with a failing unit reports the
+unit instead of aborting the process; `-c -a` costs a fraction of a second on small instead of
+22 s.

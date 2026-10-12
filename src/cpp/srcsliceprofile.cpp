@@ -24,39 +24,6 @@ SliceProfile::SliceProfile(
         dvars(dv), containsDeclaration(containsDecl), controlEdges(edges),
         visited(visit) {}
 
-SliceProfile::SliceProfile(const SliceProfile& rhs) {
-    declPosition = rhs.declPosition;
-    file = rhs.file;
-    function = rhs.function;
-    nameOfContainingClass = rhs.nameOfContainingClass;
-    containingNameSpaces = rhs.containingNameSpaces;
-    language = rhs.language;
-    checksum = rhs.checksum;
-    potentialAlias = rhs.potentialAlias;
-    dereferenced = rhs.dereferenced;
-    isGlobal = rhs.isGlobal;
-    classMemberVar = rhs.classMemberVar;
-    containsDeclaration = rhs.containsDeclaration;
-    isPointer = rhs.isPointer;
-    isReference = rhs.isReference;
-    variableName = rhs.variableName;
-    variableType = rhs.variableType;
-    definitions = rhs.definitions;
-    uses = rhs.uses;
-    dvars = rhs.dvars;
-    aliases = rhs.aliases;
-    controlEdges = rhs.controlEdges;
-    cfunctions = rhs.cfunctions;
-    endOfScope = rhs.endOfScope;
-    visited = rhs.visited;
-    showControlEdges = rhs.showControlEdges;
-    currentPointerReference = rhs.currentPointerReference;
-    isPotentialArray = rhs.isPotentialArray;
-    ignorePtrRef = rhs.ignorePtrRef;
-    isFragment = rhs.isFragment;
-    expandCalls = rhs.expandCalls;
-}
-
 bool SliceProfile::operator==(const SliceProfile& rhs) const {
     if (this == &rhs) return true; // self-check protection
 
@@ -121,7 +88,7 @@ std::ostream& operator<<(std::ostream& out, SliceProfile& profile) {
 
     out << "    \"dependence\":[";
     first = true;
-    for (auto dvar : profile.dvars) {
+    for (const auto& dvar : profile.dvars) {
         if (!first) {
             out << ",";
         }
@@ -132,7 +99,7 @@ std::ostream& operator<<(std::ostream& out, SliceProfile& profile) {
 
     out << "    \"aliases\":[";
     first = true;
-    for (auto alias : profile.aliases) {
+    for (const auto& alias : profile.aliases) {
         if (!first) {
             out << ",";
         }
@@ -143,7 +110,7 @@ std::ostream& operator<<(std::ostream& out, SliceProfile& profile) {
 
     out << "    \"calls\":[";
     first = true;
-    for (auto cfunc : profile.cfunctions) {
+    for (const auto& cfunc : profile.cfunctions) {
         if (!first) {
             out << ",";
         }
@@ -164,7 +131,7 @@ std::ostream& operator<<(std::ostream& out, SliceProfile& profile) {
     // "use": [ { "start": "2:10", "end": "2:17" }, ... ]
     out << "    \"use\":[";
     first = true;
-    for (auto use : profile.uses) {
+    for (const auto& use : profile.uses) {
         if (!first) {
             out << ",";
         }
@@ -176,7 +143,7 @@ std::ostream& operator<<(std::ostream& out, SliceProfile& profile) {
     // "definition": [ { "start": "2:10", "end": "2:17" }, ... ]
     out << "    \"definition\":[";
     first = true;
-    for (auto def : profile.definitions) {
+    for (const auto& def : profile.definitions) {
         if (!first) {
             out << ",";
         }
@@ -189,7 +156,7 @@ std::ostream& operator<<(std::ostream& out, SliceProfile& profile) {
 
         out << "    \"controlEdges\":[";
         first = true;
-        for (auto edge : profile.controlEdges) {
+        for (const auto& edge : profile.controlEdges) {
             if (!first) {
                 out << ",";
             }

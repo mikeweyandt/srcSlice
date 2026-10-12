@@ -35,7 +35,8 @@ include_directories(${LIBXML2_INCLUDE_DIR}
 
 # Sanitizer builds for the unit tests, e.g.
 #   cmake -S . -B build-tsan -G Ninja -DSRCSLICE_SANITIZER=thread -DCMAKE_BUILD_TYPE=RelWithDebInfo
-#   cmake --build build-tsan && ctest --test-dir build-tsan -L srcslice
+#   cmake --build build-tsan -j 8 && ctest --test-dir build-tsan -L srcslice
+# (an instrumented compile of the handler peaks at ~1.3 GB, so keep -j small on a desktop)
 # Applied before the subdirectories so srcDispatch/srcSAX are instrumented as well.
 set(SRCSLICE_SANITIZER "" CACHE STRING "Build with -fsanitize=<address|thread|undefined> (empty = off)")
 if(SRCSLICE_SANITIZER)

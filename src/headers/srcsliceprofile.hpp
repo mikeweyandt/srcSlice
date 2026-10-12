@@ -33,18 +33,24 @@ public:
             std::set<std::pair<SlicePosition, SlicePosition>> edges = {},
             bool containsDecl = false, bool visit = false);
 
-    SliceProfile(const SliceProfile& rhs);
+    // defaulted so the implicit move operations exist: merging and fragment removal move
+    // profiles (eight strings and six sets each) instead of copying them
+    SliceProfile(const SliceProfile& rhs) = default;
+    SliceProfile(SliceProfile&& rhs) noexcept = default;
+    SliceProfile& operator=(const SliceProfile& rhs) = default;
+    SliceProfile& operator=(SliceProfile&& rhs) noexcept = default;
 
     bool operator==(const SliceProfile& rhs) const;
     bool operator!=(const SliceProfile& rhs) const;
 
     SlicePosition declPosition;
-    std::string file;
-    std::string function;
-    std::string nameOfContainingClass;
+    // interned (shared text, 8 bytes each): identical for every profile of a unit or function
+    InternedString file;
+    InternedString function;
+    InternedString nameOfContainingClass;
     std::vector<std::string> containingNameSpaces;
-    std::string language;
-    std::string checksum;
+    InternedString language;
+    InternedString checksum;
     bool potentialAlias = false;
     bool dereferenced = false;
 
@@ -56,7 +62,7 @@ public:
     bool isReference = false;
 
     std::string variableName;
-    std::string variableType;
+    InternedString variableType;
 
     std::set<SlicePosition> definitions;
     std::set<SlicePosition> uses;

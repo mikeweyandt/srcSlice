@@ -1,8 +1,9 @@
 # How data flows through srcslice
 
 A walk from the srcML archive on disk to the JSON on stdout, in the order things
-happen, with the file and line where each step lives. Line numbers refer to the
-`benchmarks` branch as of October 2026 (srcDispatch `09a669a`, srcSAX `93cbbee`).
+happen, with the file where each step lives. Describes the `benchmarks` branch after the
+performance work of October 2026 (`progress.md` has the step-by-step record; sections 1-3 and
+5 still cite the line numbers of the srcDispatch/srcSAX and worker code, which did not move).
 
 ```
  archive.xml ──libxml2 SAX2──▶ srcSAX (C) ──▶ srcSAXController/cppCallbackAdapter (C++)
@@ -14,20 +15,23 @@ happen, with the file and line where each step lives. Line numbers refer to the
                         policy stack: UnitPolicy ▶ FunctionPolicy ▶ BlockPolicy ▶ ExprStmtPolicy ▶ ExpressionPolicy ▶ NamePolicy …
                                                       │  each </element> copies its *Data into the parent
                                                       ▼
-                            </unit>  ──▶  SrcSliceHandler::Notify  ──▶  backlog.push(new SrcSliceWorker(UnitData))
+                            </unit>  ──▶  SrcSliceHandler::Notify  ──▶  bounded backlog (waits when full)
                                                                                    │
-                     parse thread ◀── backlogMutex ──▶ ManageThreads thread        │ one std::thread per unit
+                     parse thread ◀── backlogMutex + two condition variables ──▶ ManageThreads thread
+                                                      │                            │ one std::thread per unit, ≤ threadCount at a time
                                                       │                            ▼
-                                                      │               SrcSliceWorker::Perform → Blob (per-unit profileMap …)
+                                                      │               SrcSliceWorker::Perform → Blob (per-unit profileMap …), unit model dropped
                                                       ▼
-                           MergeStructures: Blob ⊎ global profileMap/functionSigMap, then ComputeInterprocedural() over everything
+                           MergeStructures (outside the lock, in archive order): Blob ⊎ global profileMap/functionSigMap — appends only
                                                       │
                                                       ▼  after the last unit
-                               Finalize(): mergeFragments + ModifySlice (UpdateCalls / ResolveCall)
+            Finalize(): ComputeControlPaths (-c) → mergeFragments → UpdateCalls + ResolveCall for every declared profile → alias fixpoint (-a)
                                                       │
                                                       ▼
-                               main(): copy of profileMap → ostringstream JSON → string → file/stdout
+                               main(): profileMap by reference → JSON streamed to file/stdout
 ```
+
+---
 
 ## 1. libxml2 → srcSAX (C layer)
 
@@ -112,18 +116,24 @@ for srcDiff) plus a `DiffOperation`. Children of mixed type are held as `DeltaEl
 recovered with `std::any_cast<std::shared_ptr<X>>(elem.GetElement())`. Every `ElementData` carries
 `startPosition`/`endPosition` as `DeltaElement<Position>` (`ElementData.hpp:16`).
 
-## 4. Hand-off: one `SrcSliceWorker` per unit
+## 4. Hand-off: one `SrcSliceWorker` per unit, bounded
 
-`UnitPolicy` notifies `SrcSliceHandler`, the single `PolicyListener` registered at construction
-(`srcslicehandler.cpp:51`). `SrcSliceHandler::Notify` (`:114`):
+`UnitPolicy` notifies `SrcSliceHandler`, the single `PolicyListener` registered at construction.
+`SrcSliceHandler::Notify`:
 
-- copies the unit (`policy->Data<UnitData>()`, `:115`),
-- records `#include`s per file in `fileDependencyTable` (`:118-120`, used later to glue fragments),
-- locks `backlogMutex` and pushes `new SrcSliceWorker(unit, ctx, …)` (`:123-128`).
+- takes the unit (`policy->Data<UnitData>()`),
+- records `#include`s per file in `fileDependencyTable` (used later to glue fragments),
+- builds a `SrcSliceWorker` outside the lock, then waits on `spaceCv` until the backlog has fewer
+  than `backlogCap` units (`--backlog`, default = threads), gives the worker its sequence number
+  (archive order) and pushes it; `backlogCv` wakes the manager.
+- If the run has been aborted (a worker threw, or the parse failed) it calls `stop_parser()` on
+  the active srcSAX handler instead, so no exception crosses libxml2's C frames.
 
-`SrcSliceWorker` (`srcsliceworker.hpp`) owns the `shared_ptr<UnitData>`, a `SliceCtx` snapshot of
-the file path/checksum/language/namespaces (`srcslicecollection.cpp:290`), and an empty `Blob`.
-The parse thread then returns to libxml2 and continues with the next unit.
+`SrcSliceWorker` owns the `shared_ptr<UnitData>`, a `SliceCtx` snapshot of the file
+path/checksum/language/namespaces, an empty `Blob`, its `seq`, an `error` slot and an `onDone`
+callback. The parse thread then returns to libxml2 and continues with the next unit; when the
+backlog is full it blocks there, which is what bounds the number of parsed unit models in
+memory (M5).
 
 ## 5. Worker: unit model → `Blob`
 
@@ -137,7 +147,7 @@ the worker-private `Blob` (`srcsliceworker.hpp`, essentially a private copy of t
 | pass | entry | what it produces |
 |---|---|---|
 | globals | `ProcessDecls` `:233` | a `SliceProfile` per file-scope declaration (`isGlobal`), plus initializer uses/defs via `ParseExpr` |
-| signatures | `ProcessSignatures` `:351` → `ProcessFunctionSignature` `:1464` | `FunctionSignatureData` per function/ctor/dtor/method/operator in `functionSigMap[name]`; keeps the `parameters` vector of `DeclData` pointers |
+| signatures | `ProcessSignatures` `:351` → `ProcessFunctionSignature` `:1464` | `FunctionSignatureData` per function/ctor/dtor/method/operator in `functionSigMap[name]`; copies each parameter's name and name position (`SignatureParameter`), nothing of the unit model |
 | free functions | `ProcessFunctions` `:388` | parameters → profiles (`ProcessFunctionParameters` `:1405`), ctor init lists (`:527`), then the body (`ProcessStmts` `:559`) |
 | classes | `ProcessClasses` `:402` | fields → profiles, then ctors/dtor/methods/operators recursively, nested classes |
 
@@ -167,71 +177,92 @@ The profile that receives a use/def is chosen by `findValidProfile` (`srcslicepa
 most recently declared profile of that name whose scope contains the position
 (`SliceProfile::inScope`, `srcsliceprofile.cpp:234`), searching the name's vector backwards.
 
-## 6. Merge into the global state
+## 6. Manager: start workers, merge in archive order
 
-Back in `ManageThreads`, when a worker reports `Finished()` the manager joins its thread and calls
-`MergeStructures` (`srcslicehandler.cpp:133`) **while still holding `backlogMutex`** (the
-`lock_guard` at `:230` spans the whole loop body) and additionally `dataMutex` (`:136`). It appends
-every Blob vector into the handler's vectors (`profileMap[name]` gets the worker's profiles appended,
-`:140-147`; same for `functionSigMap` and the eight control-flow vectors, `:150-192`), then runs,
-over the **entire** accumulated state:
+`ManageThreads` runs on its own thread for the duration of the parse and sleeps on `backlogCv`
+between events (no polling). Each wake-up does three things, in order:
 
-- `ComputeControlPaths()` (`:386`, only with `-c`) — for every profile, order its slice lines and
-  derive edges from the loop/if position tables;
-- `ComputeAliasInterprocedural()` (`:531`, only with `-a`);
-- `ComputeInterprocedural()` (`:829`) — `ResolveCall` on every profile in `profileMap`. `ResolveCall`
-  (`:837`) returns immediately for profiles already `visited`; otherwise, for each `cfunctions`
-  entry it finds the signature by position, locates the parameter's profile (`ArgumentProfile`
-  `:501`), and copies the parameter's uses/definitions/aliases/dvars/controlEdges into the argument's
-  profile (`:940-986`). Unresolvable calls mark the profile `partial`.
+1. **Start** workers while the backlog is non-empty, fewer than `threadCount` are running and
+   fewer than `maxInFlight` (`--in-flight`, default 2 × threads) units are started-but-unmerged.
+   A started worker moves from `backlog` to `inFlight` (a deque in start = archive order) and
+   `spaceCv` wakes the parser. `worker->Start()` spawns `std::thread(&SrcSliceWorker::Perform)`;
+   `Perform` publishes completion on every exit path (`jobFinished`, then `onDone`, which
+   decrements `running` under the lock and notifies the manager) and drops the unit model as
+   soon as the Blob exists.
+2. **Merge** the front of `inFlight` once it has finished: the manager joins the thread and calls
+   `MergeStructures` **with the lock released**. The merge only appends: `profileMap[name]` gets
+   the worker's profiles moved in (likewise `functionSigMap` and the eight control-flow vectors).
+   Nothing else happens per unit any more, so the merge cost no longer grows with the amount
+   already merged, and because units are merged strictly in sequence order the result is the
+   same for every thread count (`-t N` output is byte-identical to `-t 1`).
+3. **Exit** when the parse is done and both queues are empty. If a worker failed, the manager
+   records the first error, sets `abortRun`, lets running workers finish and drops the rest;
+   `RunPipeline` then rethrows it (a `std::runtime_error` naming the unit) after joining.
 
-The worker (and with it the unit's object model) is deleted after the merge (`:243`).
+Memory held by the pipeline at any time: at most `backlogCap` unit models waiting,
+`threadCount` being sliced, `maxInFlight` Blobs waiting to be merged.
 
-## 7. Finalize: fragments and partial slices
+## 7. Finalize: one pass over the complete structure
 
-After `control.parse` returns the parse thread sets `unitsScaned`, joins the manager thread and
-calls `Finalize()` (`:570`). For every name group:
+After `control.parse` returns, `RunPipeline` marks the parse done, joins the manager and the
+constructor calls `Finalize()`, a single pass in an order where every step sees finished input:
 
-- `mergeFragments` (`:583`) partitions root profiles (globals, class members) from fragments, then
-  for each fragment finds a root in the same file or in a file the fragment's file `#include`s
-  (`fileDependencyTable`, matched with `ends_with`), merges its uses/defs/… into the root
-  (`SliceProfile::merge`, `srcsliceprofile.cpp:210`) and erases the fragment.
-- `ModifySlice` (`:637`) for profiles still `partial`: `UpdateCalls` (`:656`) retries resolving
-  `cfunctions` against the now complete `functionSigMap` (handling overloads), then `ResolveCall`.
+1. `ComputeControlPaths()` (only with `-c`): for every declared profile, order its own slice
+   lines and derive edges from the loop/if position tables. Runs before any propagation, so a
+   caller's edges end up being its own plus its callees' (copied in step 3).
+2. `mergeFragments` for every name: partitions root profiles (globals, class members) from
+   fragments, then for each fragment finds a root in the same file or in a file the fragment's
+   file `#include`s (`fileDependencyTable`, matched with `ends_with`), merges its
+   uses/defs/calls/… into the root (`SliceProfile::merge`) and erases the fragment. Fragments
+   without a root are dropped here and are never resolved.
+3. `UpdateCalls` for every declared profile completes the `cfunctions` entries whose function
+   was not in the call's unit from the full `functionSigMap` (overloaded names get one entry per
+   same-arity signature whose parameter profile exists). Then `ComputeInterprocedural()` calls
+   `ResolveCall` on every declared profile: for each call entry it finds the signature by
+   position, takes the callee parameter's own profile (`ParameterProfile`: declared in the
+   signature's file at the parameter's position), resolves that profile first (recursion,
+   cycle-guarded by `visited`) and copies its uses/definitions/aliases/dvars/control edges and
+   calls into the profile being resolved. The result is the transitive closure through the
+   call graph; in a cycle the first profile to enter it copies its cycle-mates while they are
+   still being resolved, so recursive families get a traversal-order-dependent subset (see
+   `progress.md`, Step 2b).
+4. `ComputeAliasInterprocedural()` (only with `-a`), repeated until no alias list grows.
 
 ## 8. Output
 
-`main` (`src/cpp/main.cpp:79`) constructs the handler (which runs everything above), then
-`auto sliceProfileMap = srcSliceHandler.GetProfileMap();` (`:81`, a **copy** of the whole map),
-streams every profile with `containsDeclaration` into an `std::ostringstream` via
-`operator<<(ostream&, SliceProfile&)` (`srcsliceprofile.cpp:102`), takes `.str()` (`:116`), trims
-the trailing comma and writes the string to the file or stdout (`:128-133`). Fragments and
-profiles without a declaration are never printed.
+`main` constructs the handler (which runs everything above), takes `GetProfileMap()` by
+reference and streams every profile with `containsDeclaration` straight to the output file or
+stdout through `operator<<(ostream&, SliceProfile&)`; entries are separated by `",\n"` and the
+document closed with `"\n}"`, the same bytes the old build-a-string-then-trim code produced.
+Fragments and profiles without a declaration are never printed.
 
 ## 9. Threads and locks
 
 | thread | created at | does | waits on |
 |---|---|---|---|
-| main / parse | process start | libxml2 parse → policies → `Notify` (push to backlog) → `Finalize` → JSON | `backlogMutex` in `Notify`; joins manager |
-| manager (`ManageThreads`) | `srcslicehandler.cpp:47` | spins over worker slots, starts workers, merges Blobs, interprocedural | nothing: loops without sleeping, taking `backlogMutex` every iteration |
-| worker ×N (`SrcSliceWorker::Perform`) | per unit, `srcsliceworker.cpp:48` | builds one Blob | — (joined by manager) |
+| main / parse | process start | libxml2 parse → policies → `Notify` (bounded push) → joins manager → `Finalize` → JSON | `spaceCv` in `Notify` when the backlog is full |
+| manager (`ManageThreads`) | `RunPipeline` | starts workers, merges Blobs in archive order | `backlogCv`: unit queued, worker finished, parse done or abort |
+| worker ×N (`SrcSliceWorker::Perform`) | per unit | builds one Blob, drops the unit model, publishes completion | — (joined by the manager before its Blob is merged) |
 | progress bar (`-p`) | `IdleBar`/`ProgressBar` | redraws every 2 ms | — |
 
-`threadCount` defaults to CPU count + 2 (`main.cpp:13`). Only the Blob construction is parallel;
-parsing, merging and all interprocedural work are serial, and the merge blocks the parser because
-both need `backlogMutex`.
+`threadCount` defaults to CPU count + 2 (`main.cpp`). Blob construction is the parallel part;
+the parse, the merge appends and the single `Finalize` pass are serial. One mutex
+(`backlogMutex`) guards the queues and counters; the merge itself runs outside it.
+`SlicePosition::InternFileName` / `InternedString::Intern` take a second, process-wide mutex
+only on a per-thread cache miss.
 
 ## 10. What lives in memory, and for how long
 
 | data | created | freed | notes |
 |---|---|---|---|
 | libxml2 parser buffers | start | end | streaming; small |
-| one unit's object model (`UnitData` tree) | during its `<unit>` | after its Blob is merged | copied once at `</unit>`; survives in the backlog if workers/merge lag behind the parser |
-| worker `Blob` | worker start | merged, then freed | profiles are moved, not copied, into the global map |
-| global `profileMap` (`SliceProfile` per declaration **and per fragment**) | first merge | process exit | the dominant long-lived structure; each profile holds 8 strings and 6 `std::set`s of `SlicePosition` |
-| `functionSigMap` (`FunctionSignatureData`) | first merge | exit | keeps `shared_ptr<DeclData>` parameters, so parts of every unit's parse tree stay alive |
+| one unit's object model (`UnitData` tree) | during its `<unit>` | when its worker has built the Blob | at most `backlogCap` waiting + `threadCount` being sliced |
+| worker `Blob` | worker start | merged, then freed | at most `maxInFlight`; profiles are moved into the global map |
+| global `profileMap` (`SliceProfile` per declaration **and per fragment**) | first merge | process exit | the dominant long-lived structure; fragments are erased in `Finalize` step 2 |
+| `functionSigMap` (`FunctionSignatureData`) | first merge | exit | slim parameter copies (`SignatureParameter`); the parse tree is not retained |
 | control-flow position vectors | first merge | exit | only read with `-c` |
-| JSON | `main` | exit | map copy + ostringstream + `.str()` copy exist at the same time |
+| interned strings (file names, function names, types, checksums) | first use | exit | one copy per distinct text; `SlicePosition` is 32 bytes |
+| JSON | `main` | — | streamed; nothing is buffered beyond the ostream |
 
 ## 11. Key types
 

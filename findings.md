@@ -2,9 +2,31 @@
 
 Review of the `benchmarks` branch (srcslice at `da079ae`, srcDispatch `09a669a`, srcSAX `93cbbee`)
 against the v0.1.0 benchmark baseline. `dataflow.md` explains the pipeline these findings refer to;
-line numbers are the same ones used there. Everything listed is something a focused change can fix,
-ordered by expected payoff. Measured numbers come from the dev container (Ubuntu 26.04, 32 cores,
-Release build) unless noted.
+the line numbers below are those of the reviewed revision. Everything listed is something a focused
+change can fix, ordered by expected payoff. Measured numbers come from the dev container (Ubuntu
+26.04, 32 cores, Release build) unless noted.
+
+## Status (October 2026, srcslice v0.2.6)
+
+`progress.md` records each step with its gate and numbers. Done, in order: S2 + M5 (condition-variable
+manager, bounded backlog, in-order merge: output no longer depends on the thread count), S1 (one
+resolution pass in `Finalize`; `ResolveCall` writes into the profile being resolved and resolves the
+exact callee parameter first), M6/S8 (streamed output), M1 (32-byte `SlicePosition`), M3 (slim
+signature parameters), M2 (interned profile strings and call names), plus the defaulted copy/move
+members that let the merge move instead of copy.
+
+| input | wall v0.1.0 → v0.2.6 | max RSS v0.1.0 → v0.2.6 | output |
+|---|---|---|---|
+| medium (PostgreSQL) | 24.3 s → 12.8 s | 3.0 GB → 1.2 GB | 265 MB → 942 MB |
+| medium-cpp (OpenCV) | 31.2 s → 20.7 s | 4.0 GB → 1.7 GB | 400 MB → 1.7 GB |
+| small with `-c -a` | 22.0 s → 0.27 s | 81 MB → 50 MB | 4.7 MB → 5.7 MB |
+
+The output grew because the slices now carry the full transitive closure through the call graph;
+before, resolution was frozen after each unit's merge and most cross-unit data never arrived (or
+arrived in the wrong entry, see "Correctness issues"). In recursive call families the closure a
+profile gets still depends on the traversal order of the depth-first `ResolveCall` (documented in
+`progress.md`, Step 2b; a fixpoint would make it exact). Still open: S3-S7 and S9, M4, M7, and the
+kernel inputs have not been re-measured since v0.1.0.
 
 ## What the baseline says
 
@@ -300,14 +322,17 @@ Not performance, but worth a ticket each:
 - srcDispatch `TypeData::copyAs`, `NameData::copyAs`, `ExpressionData::copyAs` cast the
   `DeltaElement` wrapper instead of its value (fixed in this working tree, not yet upstream), and
   srcSAX dereferences a possibly null libxml2 error (same).
-- **Multithreaded output is not reproducible.** Two 32-thread runs on `small` differ in 8 of
-  4,669 entries (fields `use`, `calls`, `definition`), and a 32-thread run differs from a `-t 1`
-  run in 32 entries; `-t 1` is identical run to run. The interprocedural pass (S1) resolves against
-  whatever has been merged so far, so the result depends on unit arrival order, and the
-  `operator<` collision above makes which of two same-line:column positions survives depend on
-  insertion order. The regression goldens in `benchmark/golden/` are therefore recorded with
-  `-t 1`; fixing S1 so that resolution happens once over the complete map should make `-t N`
-  match them.
+- **Multithreaded output was not reproducible** (fixed, v0.2.0). Two 32-thread runs on `small`
+  differed in 8 of 4,669 entries because units were merged in completion order and resolution ran
+  per merge. Units are now merged in archive order and resolved once, so `-t N` is byte-identical to
+  `-t 1` and the benchmark harness fails a run whose threaded output differs from the golden.
+- **Resolution wrote into the wrong profile** (fixed, v0.2.1). `ResolveCall` copied a callee
+  parameter's data into `profileMap[name].back()`, the last profile sharing the argument's name,
+  and pre-resolved `.back()` of every parameter name; with common names (`i`, `ctx`, `data`) the
+  data landed in unrelated variables. It now writes into the profile being resolved and resolves the
+  exact parameter (by file and position) first.
+- **Worker or parse errors terminated the process** (fixed, v0.2.0): they now surface as a
+  `std::runtime_error` naming the unit.
 - The output is not valid JSON when a name contains a quote: `operator "" _a` is written
   unescaped (`srcsliceprofile.cpp:102` writes every string with bare `<<`), and duplicate top-level
   keys occur when identical files appear twice in an archive (same unit hash). 8 entries in `small`
@@ -315,12 +340,11 @@ Not performance, but worth a ticket each:
 
 ## Suggested order
 
-1. S1 + S2 + M5 together (manager rewrite: condition variable, bounded queue, merge outside the
-   lock, interprocedural once or incremental). Biggest effect on large inputs, small code.
-2. S8/M6 (two lines), then M3 (one constructor), then M1 + M2 (interning + compact positions, a
-   contained refactor of `SlicePosition`/`SliceProfile` and their printers).
+1. ~~S1 + S2 + M5 together~~ (done, v0.2.0-v0.2.2).
+2. ~~S8/M6, M3, M1 + M2~~ (done, v0.2.3-v0.2.6).
 3. S3 and S4 in srcDispatch/srcSAX (parse floor), S5 (thread pool), S6/S7 (indexes in the global
-   structures), M4 (slim fragments).
+   structures; `ParameterProfile` still scans every same-named profile per call), M4 (slim fragments),
+   sorted vectors instead of `std::set` for the position sets.
 4. M7 if the above are not enough for the full kernel.
 
 Measure each step with `./benchmark/run.sh --sizes small,medium,medium-cpp`, confirm the tests
