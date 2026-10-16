@@ -350,6 +350,17 @@ Not performance, but worth a ticket each:
   non-transitive call ordering had collapsed (many with an empty definition position or name).
   Left for a product decision; it would also unblock batching the call-entry merges in
   `ResolveCall`.
+- **Struct members are matched by identifier across the tree** (seen in the full-kernel output,
+  October 2026). `mergeFragments` glues an unresolved name in a file to a declared profile of
+  the same name reachable through the file's includes, with no type information: the `char
+  name[]` member of `struct module` (`include/linux/module.h:404`) collects 3,982 "definitions"
+  in 2,018 files, the `.name = "..."` initialisers of unrelated structs, and 826 "uses" that are
+  mostly the parameters of every `sprintf`/`strcmp`/`memcpy` in the tree, reached through the
+  call resolution by name (every function of that name is a callee; there is no build
+  configuration). The reach of header-declared members is therefore meaningless, and the
+  call-name resolution inflates every slice that passes a value to a common library function.
+  `benchmark/slicestats.py` shows the effect; a fix needs the member's enclosing struct type
+  in the profile key and a translation-unit-aware callee choice.
 - `GetSimpleFunctionName` uses `find_last_of("::")`/`find_last_of("->")` which match any single
   character of the set, and the `->` branch at `srcsliceworker.cpp:1161` splits on `"."`.
 - `ManageThreads` reads `backlog.empty()` for the exit test only under the lock, but `Notify` can

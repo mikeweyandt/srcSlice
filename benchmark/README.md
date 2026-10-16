@@ -130,6 +130,19 @@ did before v0.2.18). A golden records the input commit, the srcslice commit
 and the arguments it was produced with; verifying against a golden recorded for a different
 input commit or with different arguments prints a warning first.
 
+## Slice statistics
+
+`benchmark/slicestats.py` turns a slice output into dataflow statistics: per pair of top-level
+directories, how many variables declared in one are used in the other (and the same one level
+down inside `drivers/`), how many variables leave their subsystem, the distribution of a slice's
+reach (distinct files among its positions), the variables with the widest reach, and the same
+for variables declared in probe functions (a driver's device-context struct). It reads the
+output in parallel byte ranges, so the 41.7 GB full-kernel output takes about 15 s on 32 cores:
+
+```bash
+./benchmark/slicestats.py benchmark/cache/out/x-large.json --summary   # writes x-large.json.stats.json
+```
+
 ## Reading the tables
 
 The run summary lists, per input: file count, source and archive size, one-off srcml
